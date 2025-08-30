@@ -13,8 +13,8 @@ COPY package*.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY frontend/package*.json ./frontend/
 COPY npx-cli/package*.json ./npx-cli/
 
-# Install pnpm and dependencies (cached if package files unchanged)
-RUN npm install -g pnpm
+# Install pnpm, Claude Code, and dependencies (cached if package files unchanged)
+RUN npm install -g pnpm @anthropic-ai/claude-code
 RUN pnpm install
 
 COPY frontend/ ./frontend/
@@ -22,9 +22,10 @@ COPY shared/ ./shared/
 RUN cd frontend && npm run build
 
 # Copy Rust dependencies for cargo cache
-COPY backend/ ./backend/
+COPY crates/ ./crates/
+COPY assets/ ./assets/
 COPY Cargo.toml ./
-RUN cargo build --release --manifest-path backend/Cargo.toml
+RUN cargo build --release
 
 # Expose port
 ENV HOST=0.0.0.0
@@ -34,4 +35,4 @@ EXPOSE 3000
 # Run the application
 WORKDIR /repos
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["/app/target/release/vibe-kanban"]
+CMD ["/app/target/release/server"]
