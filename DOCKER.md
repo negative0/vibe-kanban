@@ -20,10 +20,10 @@ This guide explains how to deploy Vibe Kanban using Docker Compose with nginx re
 
 ## Architecture
 
-The Docker Compose setup includes:
+The Docker setup includes a single consolidated container with:
 - **Backend**: Rust/Axum server running on port 3001
-- **Frontend**: React/Vite application served by nginx
-- **Nginx**: Reverse proxy with basic authentication on port 80
+- **Frontend**: React/Vite application built and served by nginx
+- **Nginx**: Web server with basic authentication serving frontend on port 80 and proxying API calls to backend
 
 ## Configuration
 
@@ -57,7 +57,7 @@ export VITE_API_BASE_URL=http://backend:3001
 
 ### Nginx Configuration
 
-The nginx configuration (`nginx.conf`) includes:
+The nginx configuration (`nginx-consolidated.conf`) includes:
 - Basic authentication for all routes
 - Reverse proxy to backend API (`/api/*`)
 - Static asset caching

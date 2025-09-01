@@ -1,7 +1,7 @@
 FROM node:18-alpine
 
-# Install Rust and dependencies
-RUN apk add --no-cache curl build-base perl tini
+# Install Rust, nginx and dependencies
+RUN apk add --no-cache curl build-base perl tini nginx apache2-utils
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -17,22 +17,42 @@ COPY npx-cli/package*.json ./npx-cli/
 RUN npm install -g pnpm @anthropic-ai/claude-code
 RUN pnpm install
 
+# Build frontend
 COPY frontend/ ./frontend/
 COPY shared/ ./shared/
-RUN cd frontend && npm run build
+WORKDIR /app/frontend
+RUN npm run build
 
-# Copy Rust dependencies for cargo cache
+WORKDIR /app
+
+# Copy Rust dependencies and build backend
 COPY crates/ ./crates/
 COPY assets/ ./assets/
 COPY Cargo.toml ./
 RUN cargo build --release
 
-# Expose port
-ENV HOST=0.0.0.0
-ENV PORT=3000
-EXPOSE 3000
+# Create nginx directories and copy built frontend
+RUN mkdir -p /var/www/html
+RUN cp -r /app/frontend/dist/* /var/www/html/
 
-# Run the application
+# Copy nginx configuration
+COPY nginx.conf /etc/nginx/nginx.conf
+
+# Copy basic auth file
+COPY nginx/.htpasswd /etc/nginx/.htpasswd
+
+# Create startup script
+RUN echo '#!/bin/sh' > /start.sh && \
+    echo 'nginx &' >> /start.sh && \
+    echo 'cd /repos && /app/target/release/server' >> /start.sh && \
+    chmod +x /start.sh
+
+# Expose ports
+EXPOSE 80 3001
+
+# Set working directory for runtime
 WORKDIR /repos
+
+# Use tini and run startup script
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["/app/target/release/server"]
+CMD ["/start.sh"]

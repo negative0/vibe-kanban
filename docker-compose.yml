@@ -1,7 +1,10 @@
 services:
-  # Backend service (Rust/Axum server)
-  backend:
+  # Consolidated Vibe Kanban service (Frontend + Backend + Nginx)
+  vibe-kanban:
     build: .
+    ports:
+      - "${NGINX_PORT_HTTP:-80}:80"
+      - "${BACKEND_PORT:-3001}:3001"
     environment:
       - HOST=0.0.0.0
       - PORT=3001
@@ -10,40 +13,7 @@ services:
       - ./repos:/repos
       - ./dev_assets_seed:/app/dev_assets_seed
       - ~/.claude:/root/.claude
-    networks:
-      - vibe-network
     restart: unless-stopped
-
-  # Frontend service (React/Vite)  
-  frontend:
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
-    environment:
-      - VITE_API_BASE_URL=http://backend:3001
-    networks:
-      - vibe-network
-    restart: unless-stopped
-
-  # Nginx reverse proxy with basic auth
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "${NGINX_PORT_HTTP:-80}:80"
-      - "${NGINX_PORT_HTTPS:-443}:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
-    networks:
-      - vibe-network
-    depends_on:
-      - frontend
-      - backend
-    restart: unless-stopped
-
-networks:
-  vibe-network:
-    driver: bridge
 
 volumes:
   repos_data:
