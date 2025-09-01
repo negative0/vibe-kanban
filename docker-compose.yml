@@ -10,7 +10,7 @@ services:
       - PORT=3001
       - BACKEND_PORT=3001
     volumes:
-      - ./repos:/repos
+      - ${REPO_DIR:-./repos}:/repos
       - ./dev_assets_seed:/app/dev_assets_seed
       - ~/.claude:/root/.claude
       - ~/.ssh:/root/.ssh
