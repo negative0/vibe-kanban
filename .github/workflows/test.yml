@@ -2,7 +2,10 @@ name: Test
 
 on:
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+      - louis/fe-revision
+      - gabriel/share
   workflow_dispatch:
 
 concurrency:
@@ -28,6 +31,11 @@ jobs:
 
       - name: Lint frontend
         run: cd frontend && npm run lint
+
+      - name: Check i18n regressions
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref || 'main' }}
+        run: ./scripts/check-i18n.sh
 
       - name: Format check frontend
         run: cd frontend && npm run format:check
@@ -60,4 +68,4 @@ jobs:
           cargo fmt --all -- --check
           npm run generate-types:check
           cargo test --workspace
-          cargo clippy --all --all-targets --all-features
+          cargo clippy --all --all-targets -- -D warnings  

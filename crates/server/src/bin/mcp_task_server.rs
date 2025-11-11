@@ -1,25 +1,13 @@
-use std::str::FromStr;
-
-use rmcp::{transport::stdio, ServiceExt};
+use rmcp::{ServiceExt, transport::stdio};
 use server::mcp::task_server::TaskServer;
-use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
-use tracing_subscriber::{prelude::*, EnvFilter};
-use utils::{assets::asset_dir, sentry::sentry_layer};
+use tracing_subscriber::{EnvFilter, prelude::*};
+use utils::{
+    port_file::read_port_file,
+    sentry::{self as sentry_utils, SentrySource, sentry_layer},
+};
 
 fn main() -> anyhow::Result<()> {
-    let environment = if cfg!(debug_assertions) {
-        "dev"
-    } else {
-        "production"
-    };
-    let _guard = sentry::init(("https://1065a1d276a581316999a07d5dffee26@o4509603705192449.ingest.de.sentry.io/4509605576441937", sentry::ClientOptions {
-        release: sentry::release_name!(),
-        environment: Some(environment.into()),
-        ..Default::default()
-    }));
-    sentry::configure_scope(|scope| {
-        scope.set_tag("source", "mcp");
-    });
+    sentry_utils::init_once(SentrySource::Mcp);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -37,21 +25,39 @@ fn main() -> anyhow::Result<()> {
             let version = env!("CARGO_PKG_VERSION");
             tracing::debug!("[MCP] Starting MCP task server version {version}...");
 
-            // Database connection
-            let database_url = format!(
-                "sqlite://{}",
-                asset_dir().join("db.sqlite").to_string_lossy()
-            );
+            // Read backend port from port file or environment variable
+            let base_url = if let Ok(url) = std::env::var("VIBE_BACKEND_URL") {
+                tracing::info!("[MCP] Using backend URL from VIBE_BACKEND_URL: {}", url);
+                url
+            } else {
+                let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
-            let options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(false);
-            let pool = SqlitePool::connect_with(options).await?;
+                // Get port from environment variables or fall back to port file
+                let port = match std::env::var("BACKEND_PORT").or_else(|_| std::env::var("PORT")) {
+                    Ok(port_str) => {
+                        tracing::info!("[MCP] Using port from environment: {}", port_str);
+                        port_str.parse::<u16>().map_err(|e| {
+                            anyhow::anyhow!("Invalid port value '{}': {}", port_str, e)
+                        })?
+                    }
+                    Err(_) => {
+                        let port = read_port_file("vibe-kanban").await?;
+                        tracing::info!("[MCP] Using port from port file: {}", port);
+                        port
+                    }
+                };
 
-            let service = TaskServer::new(pool)
+                let url = format!("http://{}:{}", host, port);
+                tracing::info!("[MCP] Using backend URL: {}", url);
+                url
+            };
+
+            let service = TaskServer::new(&base_url)
                 .serve(stdio())
                 .await
-                .inspect_err(|e| {
+                .map_err(|e| {
                     tracing::error!("serving error: {:?}", e);
-                    sentry::capture_error(e);
+                    e
                 })?;
 
             service.waiting().await?;

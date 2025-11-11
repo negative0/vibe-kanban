@@ -3,30 +3,31 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use db::DBService;
 use deployment::{Deployment, DeploymentError};
+use executors::profile::ExecutorConfigs;
 use services::services::{
     analytics::{AnalyticsConfig, AnalyticsContext, AnalyticsService, generate_user_id},
+    approvals::Approvals,
     auth::AuthService,
     config::{Config, load_config_from_file, save_config_to_file},
     container::ContainerService,
+    drafts::DraftsService,
     events::EventService,
+    file_search_cache::FileSearchCache,
     filesystem::FilesystemService,
     git::GitService,
     image::ImageService,
-    sentry::SentryService,
 };
 use tokio::sync::RwLock;
 use utils::{assets::config_path, msg_store::MsgStore};
 use uuid::Uuid;
 
 use crate::container::LocalContainerService;
-
 mod command;
 pub mod container;
 
 #[derive(Clone)]
 pub struct LocalDeployment {
     config: Arc<RwLock<Config>>,
-    sentry: SentryService,
     user_id: String,
     db: DBService,
     analytics: Option<AnalyticsService>,
@@ -37,12 +38,22 @@ pub struct LocalDeployment {
     image: ImageService,
     filesystem: FilesystemService,
     events: EventService,
+    file_search_cache: Arc<FileSearchCache>,
+    approvals: Approvals,
+    drafts: DraftsService,
 }
 
 #[async_trait]
 impl Deployment for LocalDeployment {
     async fn new() -> Result<Self, DeploymentError> {
         let mut raw_config = load_config_from_file(&config_path()).await;
+
+        let profiles = ExecutorConfigs::get_cached();
+        if !raw_config.onboarding_acknowledged
+            && let Ok(recommended_executor) = profiles.get_recommended_executor_profile().await
+        {
+            raw_config.executor_profile = recommended_executor;
+        }
 
         // Check if app version has changed and set release notes flag
         {
@@ -60,7 +71,6 @@ impl Deployment for LocalDeployment {
         save_config_to_file(&raw_config, &config_path()).await?;
 
         let config = Arc::new(RwLock::new(raw_config));
-        let sentry = SentryService::new();
         let user_id = generate_user_id();
         let analytics = AnalyticsConfig::new().map(AnalyticsService::new);
         let git = GitService::new();
@@ -93,6 +103,8 @@ impl Deployment for LocalDeployment {
             });
         }
 
+        let approvals = Approvals::new(msg_stores.clone());
+
         // We need to make analytics accessible to the ContainerService
         // TODO: Handle this more gracefully
         let analytics_ctx = analytics.as_ref().map(|s| AnalyticsContext {
@@ -106,14 +118,16 @@ impl Deployment for LocalDeployment {
             git.clone(),
             image.clone(),
             analytics_ctx,
+            approvals.clone(),
         );
         container.spawn_worktree_cleanup().await;
 
         let events = EventService::new(db.clone(), events_msg_store, events_entry_count);
+        let drafts = DraftsService::new(db.clone(), image.clone());
+        let file_search_cache = Arc::new(FileSearchCache::new());
 
         Ok(Self {
             config,
-            sentry,
             user_id,
             db,
             analytics,
@@ -124,6 +138,9 @@ impl Deployment for LocalDeployment {
             image,
             filesystem,
             events,
+            file_search_cache,
+            approvals,
+            drafts,
         })
     }
 
@@ -137,10 +154,6 @@ impl Deployment for LocalDeployment {
 
     fn config(&self) -> &Arc<RwLock<Config>> {
         &self.config
-    }
-
-    fn sentry(&self) -> &SentryService {
-        &self.sentry
     }
 
     fn db(&self) -> &DBService {
@@ -176,5 +189,17 @@ impl Deployment for LocalDeployment {
 
     fn events(&self) -> &EventService {
         &self.events
+    }
+
+    fn file_search_cache(&self) -> &Arc<FileSearchCache> {
+        &self.file_search_cache
+    }
+
+    fn approvals(&self) -> &Approvals {
+        &self.approvals
+    }
+
+    fn drafts(&self) -> &DraftsService {
+        &self.drafts
     }
 }

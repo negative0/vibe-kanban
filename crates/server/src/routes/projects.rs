@@ -1,23 +1,27 @@
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 use axum::{
+    Extension, Json, Router,
     extract::{Query, State},
     http::StatusCode,
     middleware::from_fn_with_state,
     response::Json as ResponseJson,
     routing::{get, post},
-    Extension, Json, Router,
 };
 use db::models::project::{
     CreateProject, Project, ProjectError, SearchMatchType, SearchResult, UpdateProject,
 };
 use deployment::Deployment;
 use ignore::WalkBuilder;
-use services::services::{file_ranker::FileRanker, git::GitBranch};
-use utils::response::ApiResponse;
+use services::services::{
+    file_ranker::FileRanker,
+    file_search_cache::{CacheError, SearchMode, SearchQuery},
+    git::GitBranch,
+};
+use utils::{path::expand_tilde, response::ApiResponse};
 use uuid::Uuid;
 
-use crate::{error::ApiError, middleware::load_project_middleware, DeploymentImpl};
+use crate::{DeploymentImpl, error::ApiError, middleware::load_project_middleware};
 
 pub async fn get_projects(
     State(deployment): State<DeploymentImpl>,
@@ -45,11 +49,23 @@ pub async fn create_project(
     Json(payload): Json<CreateProject>,
 ) -> Result<ResponseJson<ApiResponse<Project>>, ApiError> {
     let id = Uuid::new_v4();
+    let CreateProject {
+        name,
+        git_repo_path,
+        setup_script,
+        dev_script,
+        cleanup_script,
+        copy_files,
+        use_existing_repo,
+    } = payload;
+    tracing::debug!("Creating project '{}'", name);
 
-    tracing::debug!("Creating project '{}'", payload.name);
-
+    // Validate and setup git repository
+    let path = std::path::absolute(expand_tilde(&git_repo_path))?;
     // Check if git repo path is already used by another project
-    match Project::find_by_git_repo_path(&deployment.db().pool, &payload.git_repo_path).await {
+    match Project::find_by_git_repo_path(&deployment.db().pool, path.to_string_lossy().as_ref())
+        .await
+    {
         Ok(Some(_)) => {
             return Ok(ResponseJson(ApiResponse::error(
                 "A project with this git repository path already exists",
@@ -63,10 +79,7 @@ pub async fn create_project(
         }
     }
 
-    // Validate and setup git repository
-    let path = std::path::Path::new(&payload.git_repo_path);
-
-    if payload.use_existing_repo {
+    if use_existing_repo {
         // For existing repos, validate that the path exists and is a git repository
         if !path.exists() {
             return Ok(ResponseJson(ApiResponse::error(
@@ -87,7 +100,7 @@ pub async fn create_project(
         }
 
         // Ensure existing repo has a main branch if it's empty
-        if let Err(e) = deployment.git().ensure_main_branch_exists(path) {
+        if let Err(e) = deployment.git().ensure_main_branch_exists(&path) {
             tracing::error!("Failed to ensure main branch exists: {}", e);
             return Ok(ResponseJson(ApiResponse::error(&format!(
                 "Failed to ensure main branch exists: {}",
@@ -98,29 +111,43 @@ pub async fn create_project(
         // For new repos, create directory and initialize git
 
         // Create directory if it doesn't exist
-        if !path.exists() {
-            if let Err(e) = std::fs::create_dir_all(path) {
-                tracing::error!("Failed to create directory: {}", e);
-                return Ok(ResponseJson(ApiResponse::error(&format!(
-                    "Failed to create directory: {}",
-                    e
-                ))));
-            }
+        if !path.exists()
+            && let Err(e) = std::fs::create_dir_all(&path)
+        {
+            tracing::error!("Failed to create directory: {}", e);
+            return Ok(ResponseJson(ApiResponse::error(&format!(
+                "Failed to create directory: {}",
+                e
+            ))));
         }
 
         // Check if it's already a git repo, if not initialize it
-        if !path.join(".git").exists() {
-            if let Err(e) = deployment.git().initialize_repo_with_main_branch(path) {
-                tracing::error!("Failed to initialize git repository: {}", e);
-                return Ok(ResponseJson(ApiResponse::error(&format!(
-                    "Failed to initialize git repository: {}",
-                    e
-                ))));
-            }
+        if !path.join(".git").exists()
+            && let Err(e) = deployment.git().initialize_repo_with_main_branch(&path)
+        {
+            tracing::error!("Failed to initialize git repository: {}", e);
+            return Ok(ResponseJson(ApiResponse::error(&format!(
+                "Failed to initialize git repository: {}",
+                e
+            ))));
         }
     }
 
-    match Project::create(&deployment.db().pool, &payload, id).await {
+    match Project::create(
+        &deployment.db().pool,
+        &CreateProject {
+            name,
+            git_repo_path: path.to_string_lossy().to_string(),
+            use_existing_repo,
+            setup_script,
+            dev_script,
+            cleanup_script,
+            copy_files,
+        },
+        id,
+    )
+    .await
+    {
         Ok(project) => {
             // Track project creation event
             deployment
@@ -128,9 +155,10 @@ pub async fn create_project(
                     "project_created",
                     serde_json::json!({
                         "project_id": project.id.to_string(),
-                        "use_existing_repo": payload.use_existing_repo,
-                        "has_setup_script": payload.setup_script.is_some(),
-                        "has_dev_script": payload.dev_script.is_some(),
+                        "use_existing_repo": use_existing_repo,
+                        "has_setup_script": project.setup_script.is_some(),
+                        "has_dev_script": project.dev_script.is_some(),
+                        "trigger": "manual",
                     }),
                 )
                 .await;
@@ -146,32 +174,6 @@ pub async fn update_project(
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<UpdateProject>,
 ) -> Result<ResponseJson<ApiResponse<Project>>, StatusCode> {
-    // If git_repo_path is being changed, check if the new path is already used by another project
-    if let Some(new_git_repo_path) = &payload.git_repo_path {
-        if new_git_repo_path != &existing_project.git_repo_path.to_string_lossy() {
-            match Project::find_by_git_repo_path_excluding_id(
-                &deployment.db().pool,
-                new_git_repo_path,
-                existing_project.id,
-            )
-            .await
-            {
-                Ok(Some(_)) => {
-                    return Ok(ResponseJson(ApiResponse::error(
-                        "A project with this git repository path already exists",
-                    )));
-                }
-                Ok(None) => {
-                    // Path is available, continue
-                }
-                Err(e) => {
-                    tracing::error!("Failed to check for existing git repo path: {}", e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            }
-        }
-    }
-
     // Destructure payload to handle field updates.
     // This allows us to treat `None` from the payload as an explicit `null` to clear a field,
     // as the frontend currently sends all fields on update.
@@ -183,16 +185,37 @@ pub async fn update_project(
         cleanup_script,
         copy_files,
     } = payload;
-
-    let name = name.unwrap_or(existing_project.name);
-    let git_repo_path =
-        git_repo_path.unwrap_or(existing_project.git_repo_path.to_string_lossy().to_string());
+    // If git_repo_path is being changed, check if the new path is already used by another project
+    let git_repo_path = if let Some(new_git_repo_path) = git_repo_path.map(|s| expand_tilde(&s))
+        && new_git_repo_path != existing_project.git_repo_path
+    {
+        match Project::find_by_git_repo_path_excluding_id(
+            &deployment.db().pool,
+            new_git_repo_path.to_string_lossy().as_ref(),
+            existing_project.id,
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                return Ok(ResponseJson(ApiResponse::error(
+                    "A project with this git repository path already exists",
+                )));
+            }
+            Ok(None) => new_git_repo_path,
+            Err(e) => {
+                tracing::error!("Failed to check for existing git repo path: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    } else {
+        existing_project.git_repo_path
+    };
 
     match Project::update(
         &deployment.db().pool,
         existing_project.id,
-        name,
-        git_repo_path,
+        name.unwrap_or(existing_project.name),
+        git_repo_path.to_string_lossy().to_string(),
         setup_script,
         dev_script,
         cleanup_script,
@@ -217,6 +240,15 @@ pub async fn delete_project(
             if rows_affected == 0 {
                 Err(StatusCode::NOT_FOUND)
             } else {
+                deployment
+                    .track_if_analytics_allowed(
+                        "project_deleted",
+                        serde_json::json!({
+                            "project_id": project.id.to_string(),
+                        }),
+                    )
+                    .await;
+
                 Ok(ResponseJson(ApiResponse::success(())))
             }
         }
@@ -232,12 +264,17 @@ pub struct OpenEditorRequest {
     editor_type: Option<String>,
 }
 
+#[derive(Debug, serde::Serialize, ts_rs::TS)]
+pub struct OpenEditorResponse {
+    pub url: Option<String>,
+}
+
 pub async fn open_project_in_editor(
     Extension(project): Extension<Project>,
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<Option<OpenEditorRequest>>,
-) -> Result<ResponseJson<ApiResponse<()>>, StatusCode> {
-    let path = project.git_repo_path.to_string_lossy();
+) -> Result<ResponseJson<ApiResponse<OpenEditorResponse>>, StatusCode> {
+    let path = project.git_repo_path;
 
     let editor_config = {
         let config = deployment.config().read().await;
@@ -245,10 +282,29 @@ pub async fn open_project_in_editor(
         config.editor.with_override(editor_type_str)
     };
 
-    match editor_config.open_file(&path) {
-        Ok(_) => {
-            tracing::info!("Opened editor for project {} at path: {}", project.id, path);
-            Ok(ResponseJson(ApiResponse::success(())))
+    match editor_config.open_file(&path).await {
+        Ok(url) => {
+            tracing::info!(
+                "Opened editor for project {} at path: {}{}",
+                project.id,
+                path.to_string_lossy(),
+                if url.is_some() { " (remote mode)" } else { "" }
+            );
+
+            deployment
+                .track_if_analytics_allowed(
+                    "project_editor_opened",
+                    serde_json::json!({
+                        "project_id": project.id.to_string(),
+                        "editor_type": payload.as_ref().and_then(|req| req.editor_type.as_ref()),
+                        "remote_mode": url.is_some(),
+                    }),
+                )
+                .await;
+
+            Ok(ResponseJson(ApiResponse::success(OpenEditorResponse {
+                url,
+            })))
         }
         Err(e) => {
             tracing::error!("Failed to open editor for project {}: {}", project.id, e);
@@ -258,24 +314,64 @@ pub async fn open_project_in_editor(
 }
 
 pub async fn search_project_files(
+    State(deployment): State<DeploymentImpl>,
     Extension(project): Extension<Project>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(search_query): Query<SearchQuery>,
 ) -> Result<ResponseJson<ApiResponse<Vec<SearchResult>>>, StatusCode> {
-    let query = match params.get("q") {
-        Some(q) if !q.trim().is_empty() => q.trim(),
-        _ => {
-            return Ok(ResponseJson(ApiResponse::error(
-                "Query parameter 'q' is required and cannot be empty",
-            )));
-        }
-    };
+    let query = search_query.q.trim();
+    let mode = search_query.mode;
 
-    // Search files in the project repository
-    match search_files_in_repo(&project.git_repo_path.to_string_lossy(), query).await {
-        Ok(results) => Ok(ResponseJson(ApiResponse::success(results))),
-        Err(e) => {
-            tracing::error!("Failed to search files: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+    if query.is_empty() {
+        return Ok(ResponseJson(ApiResponse::error(
+            "Query parameter 'q' is required and cannot be empty",
+        )));
+    }
+
+    let repo_path = &project.git_repo_path;
+    let file_search_cache = deployment.file_search_cache();
+
+    // Try cache first
+    match file_search_cache
+        .search(repo_path, query, mode.clone())
+        .await
+    {
+        Ok(results) => {
+            tracing::debug!(
+                "Cache hit for repo {:?}, query: {}, mode: {:?}",
+                repo_path,
+                query,
+                mode
+            );
+            Ok(ResponseJson(ApiResponse::success(results)))
+        }
+        Err(CacheError::Miss) => {
+            // Cache miss - fall back to filesystem search
+            tracing::debug!(
+                "Cache miss for repo {:?}, query: {}, mode: {:?}",
+                repo_path,
+                query,
+                mode
+            );
+            match search_files_in_repo(&project.git_repo_path.to_string_lossy(), query, mode).await
+            {
+                Ok(results) => Ok(ResponseJson(ApiResponse::success(results))),
+                Err(e) => {
+                    tracing::error!("Failed to search files: {}", e);
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+        Err(CacheError::BuildError(e)) => {
+            tracing::error!("Cache build error for repo {:?}: {}", repo_path, e);
+            // Fall back to filesystem search
+            match search_files_in_repo(&project.git_repo_path.to_string_lossy(), query, mode).await
+            {
+                Ok(results) => Ok(ResponseJson(ApiResponse::success(results))),
+                Err(e) => {
+                    tracing::error!("Failed to search files: {}", e);
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
         }
     }
 }
@@ -283,6 +379,7 @@ pub async fn search_project_files(
 async fn search_files_in_repo(
     repo_path: &str,
     query: &str,
+    mode: SearchMode,
 ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
     let repo_path = Path::new(repo_path);
 
@@ -293,16 +390,40 @@ async fn search_files_in_repo(
     let mut results = Vec::new();
     let query_lower = query.to_lowercase();
 
-    // We intentionally do NOT respect gitignore here because this search is
-    // used to help users pick files like ".env" or local config files that are
-    // commonly gitignored but still need to be copied into the worktree.
-    // Include hidden files as well.
-    let walker = WalkBuilder::new(repo_path)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .hidden(false)
-        .build();
+    // Configure walker based on mode
+    let walker = match mode {
+        SearchMode::Settings => {
+            // Settings mode: Include ignored files but exclude performance killers
+            WalkBuilder::new(repo_path)
+                .git_ignore(false) // Include ignored files like .env
+                .git_global(false)
+                .git_exclude(false)
+                .hidden(false)
+                .filter_entry(|entry| {
+                    let name = entry.file_name().to_string_lossy();
+                    // Always exclude .git directories and performance killers
+                    name != ".git"
+                        && name != "node_modules"
+                        && name != "target"
+                        && name != "dist"
+                        && name != "build"
+                })
+                .build()
+        }
+        SearchMode::TaskForm => {
+            // Task form mode: Respect gitignore (cleaner results)
+            WalkBuilder::new(repo_path)
+                .git_ignore(true) // Respect .gitignore
+                .git_global(true) // Respect global .gitignore
+                .git_exclude(true) // Respect .git/info/exclude
+                .hidden(false) // Still show hidden files like .env (if not gitignored)
+                .filter_entry(|entry| {
+                    let name = entry.file_name().to_string_lossy();
+                    name != ".git"
+                })
+                .build()
+        }
+    };
 
     for result in walker {
         let entry = result?;
@@ -314,14 +435,6 @@ async fn search_files_in_repo(
         }
 
         let relative_path = path.strip_prefix(repo_path)?;
-
-        // Skip .git directory and its contents
-        if relative_path
-            .components()
-            .any(|component| component.as_os_str() == ".git")
-        {
-            continue;
-        }
         let relative_path_str = relative_path.to_string_lossy().to_lowercase();
 
         let file_name = path

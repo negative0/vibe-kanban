@@ -10,8 +10,6 @@ export type DirectoryListResponse = { entries: Array<DirectoryEntry>, current_pa
 
 export type Project = { id: string, name: string, git_repo_path: string, setup_script: string | null, dev_script: string | null, cleanup_script: string | null, copy_files: string | null, created_at: Date, updated_at: Date, };
 
-export type ProjectWithBranch = { id: string, name: string, git_repo_path: string, setup_script: string | null, dev_script: string | null, cleanup_script: string | null, copy_files: string | null, current_branch: string | null, created_at: Date, updated_at: Date, };
-
 export type CreateProject = { name: string, git_repo_path: string, use_existing_repo: boolean, setup_script: string | null, dev_script: string | null, cleanup_script: string | null, copy_files: string | null, };
 
 export type UpdateProject = { name: string | null, git_repo_path: string | null, setup_script: string | null, dev_script: string | null, cleanup_script: string | null, copy_files: string | null, };
@@ -22,7 +20,7 @@ export type SearchMatchType = "FileName" | "DirectoryName" | "FullPath";
 
 export type ExecutorAction = { typ: ExecutorActionType, next_action: ExecutorAction | null, };
 
-export type McpConfig = { servers: { [key in string]?: JsonValue }, servers_path: Array<string>, template: JsonValue, vibe_kanban: JsonValue, is_toml_config: boolean, };
+export type McpConfig = { servers: { [key in string]?: JsonValue }, servers_path: Array<string>, template: JsonValue, preconfigured: JsonValue, is_toml_config: boolean, };
 
 export type ExecutorActionType = { "type": "CodingAgentInitialRequest" } & CodingAgentInitialRequest | { "type": "CodingAgentFollowUpRequest" } & CodingAgentFollowUpRequest | { "type": "ScriptRequest" } & ScriptRequest;
 
@@ -32,17 +30,25 @@ export type ScriptRequest = { script: string, language: ScriptRequestLanguage, c
 
 export type ScriptRequestLanguage = "Bash";
 
-export type TaskTemplate = { id: string, project_id: string | null, title: string, description: string | null, template_name: string, created_at: string, updated_at: string, };
+export enum BaseCodingAgent { CLAUDE_CODE = "CLAUDE_CODE", AMP = "AMP", GEMINI = "GEMINI", CODEX = "CODEX", OPENCODE = "OPENCODE", CURSOR_AGENT = "CURSOR_AGENT", QWEN_CODE = "QWEN_CODE", COPILOT = "COPILOT" }
 
-export type CreateTaskTemplate = { project_id: string | null, title: string, description: string | null, template_name: string, };
+export type CodingAgent = { "CLAUDE_CODE": ClaudeCode } | { "AMP": Amp } | { "GEMINI": Gemini } | { "CODEX": Codex } | { "OPENCODE": Opencode } | { "CURSOR_AGENT": CursorAgent } | { "QWEN_CODE": QwenCode } | { "COPILOT": Copilot };
 
-export type UpdateTaskTemplate = { title: string | null, description: string | null, template_name: string | null, };
+export type Tag = { id: string, tag_name: string, content: string, created_at: string, updated_at: string, };
+
+export type CreateTag = { tag_name: string, content: string, };
+
+export type UpdateTag = { tag_name: string | null, content: string | null, };
+
+export type TagSearchParams = { search: string | null, };
 
 export type TaskStatus = "todo" | "inprogress" | "inreview" | "done" | "cancelled";
 
 export type Task = { id: string, project_id: string, title: string, description: string | null, status: TaskStatus, parent_task_attempt: string | null, created_at: string, updated_at: string, };
 
-export type TaskWithAttemptStatus = { id: string, project_id: string, title: string, description: string | null, status: TaskStatus, parent_task_attempt: string | null, created_at: string, updated_at: string, has_in_progress_attempt: boolean, has_merged_attempt: boolean, last_attempt_failed: boolean, profile: string, };
+export type TaskWithAttemptStatus = { has_in_progress_attempt: boolean, has_merged_attempt: boolean, last_attempt_failed: boolean, executor: string, id: string, project_id: string, title: string, description: string | null, status: TaskStatus, parent_task_attempt: string | null, created_at: string, updated_at: string, };
+
+export type TaskRelationships = { parent_task: Task | null, current_attempt: TaskAttempt, children: Array<Task>, };
 
 export type CreateTask = { project_id: string, title: string, description: string | null, parent_task_attempt: string | null, image_ids: Array<string> | null, };
 
@@ -54,37 +60,61 @@ export type CreateImage = { file_path: string, original_name: string, mime_type:
 
 export type ApiResponse<T, E = T> = { success: boolean, data: T | null, error_data: E | null, message: string | null, };
 
-export type UserSystemInfo = { config: Config, environment: Environment, profiles: Array<ProfileConfig>, };
+export type UserSystemInfo = { config: Config, analytics_user_id: string, environment: Environment, 
+/**
+ * Capabilities supported per executor (e.g., { "CLAUDE_CODE": ["SESSION_FORK"] })
+ */
+capabilities: { [key in string]?: Array<BaseAgentCapability> }, executors: { [key in BaseCodingAgent]?: ExecutorConfig }, };
 
 export type Environment = { os_type: string, os_version: string, os_architecture: string, bitness: string, };
 
-export type McpServerQuery = { profile: string, };
+export type McpServerQuery = { executor: BaseCodingAgent, };
 
 export type UpdateMcpServersBody = { servers: { [key in string]?: JsonValue }, };
 
 export type GetMcpServerResponse = { mcp_config: McpConfig, config_path: string, };
 
-export type CreateFollowUpAttempt = { prompt: string, variant: string | null, image_ids: Array<string> | null, };
+export type CreateFollowUpAttempt = { prompt: string, variant: string | null, image_ids: Array<string> | null, retry_process_id: string | null, force_when_dirty: boolean | null, perform_git_reset: boolean | null, };
 
-export type CreateGitHubPrRequest = { title: string, body: string | null, base_branch: string | null, };
+export type DraftResponse = { task_attempt_id: string, draft_type: DraftType, retry_process_id: string | null, prompt: string, queued: boolean, variant: string | null, image_ids: Array<string> | null, version: bigint, };
+
+export type UpdateFollowUpDraftRequest = { prompt: string | null, variant: string | null | null, image_ids: Array<string> | null, version: bigint | null, };
+
+export type UpdateRetryFollowUpDraftRequest = { retry_process_id: string, prompt: string | null, variant: string | null | null, image_ids: Array<string> | null, version: bigint | null, };
+
+export type ChangeTargetBranchRequest = { new_target_branch: string, };
+
+export type ChangeTargetBranchResponse = { new_target_branch: string, status: [number, number], };
+
+export type RenameBranchRequest = { new_branch_name: string, };
+
+export type RenameBranchResponse = { branch: string, };
+
+export type CreateAndStartTaskRequest = { task: CreateTask, executor_profile_id: ExecutorProfileId, base_branch: string, };
+
+export type CreateGitHubPrRequest = { title: string, body: string | null, target_branch: string | null, };
 
 export type ImageResponse = { id: string, file_path: string, original_name: string, mime_type: string | null, size_bytes: bigint, hash: string, created_at: string, updated_at: string, };
 
 export enum GitHubServiceError { TOKEN_INVALID = "TOKEN_INVALID", INSUFFICIENT_PERMISSIONS = "INSUFFICIENT_PERMISSIONS", REPO_NOT_FOUND_OR_NO_ACCESS = "REPO_NOT_FOUND_OR_NO_ACCESS" }
 
-export type Config = { config_version: string, theme: ThemeMode, profile: ProfileVariantLabel, disclaimer_acknowledged: boolean, onboarding_acknowledged: boolean, github_login_acknowledged: boolean, telemetry_acknowledged: boolean, notifications: NotificationConfig, editor: EditorConfig, github: GitHubConfig, analytics_enabled: boolean | null, workspace_dir: string | null, last_app_version: string | null, show_release_notes: boolean, };
+export type Config = { config_version: string, theme: ThemeMode, executor_profile: ExecutorProfileId, disclaimer_acknowledged: boolean, onboarding_acknowledged: boolean, github_login_acknowledged: boolean, telemetry_acknowledged: boolean, notifications: NotificationConfig, editor: EditorConfig, github: GitHubConfig, analytics_enabled: boolean | null, workspace_dir: string | null, last_app_version: string | null, show_release_notes: boolean, language: UiLanguage, git_branch_prefix: string, showcases: ShowcaseState, };
 
 export type NotificationConfig = { sound_enabled: boolean, push_enabled: boolean, sound_file: SoundFile, };
 
-export enum ThemeMode { LIGHT = "LIGHT", DARK = "DARK", SYSTEM = "SYSTEM", PURPLE = "PURPLE", GREEN = "GREEN", BLUE = "BLUE", ORANGE = "ORANGE", RED = "RED" }
+export enum ThemeMode { LIGHT = "LIGHT", DARK = "DARK", SYSTEM = "SYSTEM" }
 
-export type EditorConfig = { editor_type: EditorType, custom_command: string | null, };
+export type EditorConfig = { editor_type: EditorType, custom_command: string | null, remote_ssh_host: string | null, remote_ssh_user: string | null, };
 
 export enum EditorType { VS_CODE = "VS_CODE", CURSOR = "CURSOR", WINDSURF = "WINDSURF", INTELLI_J = "INTELLI_J", ZED = "ZED", XCODE = "XCODE", CUSTOM = "CUSTOM" }
 
 export type GitHubConfig = { pat: string | null, oauth_token: string | null, username: string | null, primary_email: string | null, default_pr_base: string | null, };
 
 export enum SoundFile { ABSTRACT_SOUND1 = "ABSTRACT_SOUND1", ABSTRACT_SOUND2 = "ABSTRACT_SOUND2", ABSTRACT_SOUND3 = "ABSTRACT_SOUND3", ABSTRACT_SOUND4 = "ABSTRACT_SOUND4", COW_MOOING = "COW_MOOING", PHONE_VIBRATION = "PHONE_VIBRATION", ROOSTER = "ROOSTER" }
+
+export type UiLanguage = "BROWSER" | "EN" | "JA" | "ES" | "KO";
+
+export type ShowcaseState = { seen_features: Array<string>, };
 
 export type DeviceFlowStartResponse = { user_code: string, verification_uri: string, expires_in: number, interval: number, };
 
@@ -94,11 +124,17 @@ export enum CheckTokenResponse { VALID = "VALID", INVALID = "INVALID" }
 
 export type GitBranch = { name: string, is_current: boolean, is_remote: boolean, last_commit_date: Date, };
 
-export type Diff = { change: DiffChangeKind, oldPath: string | null, newPath: string | null, oldContent: string | null, newContent: string | null, };
+export type Diff = { change: DiffChangeKind, oldPath: string | null, newPath: string | null, oldContent: string | null, newContent: string | null, 
+/**
+ * True when file contents are intentionally omitted (e.g., too large)
+ */
+contentOmitted: boolean, 
+/**
+ * Optional precomputed stats for omitted content
+ */
+additions: number | null, deletions: number | null, };
 
 export type DiffChangeKind = "added" | "deleted" | "modified" | "renamed" | "copied" | "permissionChange";
-
-export type FileDiffDetails = { fileName: string | null, content: string | null, };
 
 export type RepositoryInfo = { id: bigint, name: string, full_name: string, owner: string, description: string | null, clone_url: string, ssh_url: string, default_branch: string, private: boolean, };
 
@@ -112,61 +148,135 @@ base: string,
  */
 params: Array<string> | null, };
 
-export type ProfileVariantLabel = { profile: string, variant: string | null, };
-
-export type ProfileConfig = { 
+export type ExecutorProfileId = { 
 /**
- * additional variants for this profile, e.g. plan, review, subagent
+ * The executor type (e.g., "CLAUDE_CODE", "AMP")
  */
-variants: Array<VariantAgentConfig>, 
+executor: BaseCodingAgent, 
 /**
- * Unique identifier for this profile (e.g., "MyClaudeCode", "FastAmp")
+ * Optional variant name (e.g., "PLAN", "ROUTER")
  */
-label: string, 
+variant: string | null, };
+
+export type ExecutorConfig = { [key in string]?: { "CLAUDE_CODE": ClaudeCode } | { "AMP": Amp } | { "GEMINI": Gemini } | { "CODEX": Codex } | { "OPENCODE": Opencode } | { "CURSOR_AGENT": CursorAgent } | { "QWEN_CODE": QwenCode } | { "COPILOT": Copilot } };
+
+export enum BaseAgentCapability { SESSION_FORK = "SESSION_FORK", SETUP_HELPER = "SETUP_HELPER" }
+
+export type ClaudeCode = { append_prompt: AppendPrompt, claude_code_router?: boolean | null, plan?: boolean | null, approvals?: boolean | null, model?: string | null, dangerously_skip_permissions?: boolean | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type Gemini = { append_prompt: AppendPrompt, model: GeminiModel, yolo?: boolean | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type GeminiModel = "default" | "flash";
+
+export type Amp = { append_prompt: AppendPrompt, dangerously_allow_all?: boolean | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type Codex = { append_prompt: AppendPrompt, sandbox?: SandboxMode | null, ask_for_approval?: AskForApproval | null, oss?: boolean | null, model?: string | null, model_reasoning_effort?: ReasoningEffort | null, model_reasoning_summary?: ReasoningSummary | null, model_reasoning_summary_format?: ReasoningSummaryFormat | null, profile?: string | null, base_instructions?: string | null, include_plan_tool?: boolean | null, include_apply_patch_tool?: boolean | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type SandboxMode = "auto" | "read-only" | "workspace-write" | "danger-full-access";
+
+export type AskForApproval = "unless-trusted" | "on-failure" | "on-request" | "never";
+
+export type ReasoningEffort = "low" | "medium" | "high";
+
+export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
+
+export type ReasoningSummaryFormat = "none" | "experimental";
+
+export type CursorAgent = { append_prompt: AppendPrompt, force?: boolean | null, model?: string | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type Copilot = { append_prompt: AppendPrompt, model?: string | null, allow_all_tools?: boolean | null, allow_tool?: string | null, deny_tool?: string | null, add_dir?: Array<string> | null, disable_mcp_server?: Array<string> | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type Opencode = { append_prompt: AppendPrompt, model?: string | null, agent?: string | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type QwenCode = { append_prompt: AppendPrompt, yolo?: boolean | null, base_command_override?: string | null, additional_params?: Array<string> | null, };
+
+export type AppendPrompt = string | null;
+
+export type CodingAgentInitialRequest = { prompt: string, 
 /**
- * Optional profile-specific MCP config file path (absolute; supports leading ~). Overrides the default `BaseCodingAgent` config path
+ * Executor profile specification
  */
-mcp_config_path: string | null, } & ({ "CLAUDE_CODE": ClaudeCode } | { "AMP": Amp } | { "GEMINI": Gemini } | { "CODEX": Codex } | { "OPENCODE": Opencode } | { "CURSOR": Cursor });
+executor_profile_id: ExecutorProfileId, };
 
-export type VariantAgentConfig = { 
+export type CodingAgentFollowUpRequest = { prompt: string, session_id: string, 
 /**
- * Unique identifier for this profile (e.g., "MyClaudeCode", "FastAmp")
+ * Executor profile specification
  */
-label: string, 
+executor_profile_id: ExecutorProfileId, };
+
+export type CreateTaskAttemptBody = { task_id: string, 
 /**
- * Optional profile-specific MCP config file path (absolute; supports leading ~). Overrides the default `BaseCodingAgent` config path
+ * Executor profile specification
  */
-mcp_config_path: string | null, } & ({ "CLAUDE_CODE": ClaudeCode } | { "AMP": Amp } | { "GEMINI": Gemini } | { "CODEX": Codex } | { "OPENCODE": Opencode } | { "CURSOR": Cursor });
+executor_profile_id: ExecutorProfileId, base_branch: string, };
 
-export type ProfileConfigs = { profiles: Array<ProfileConfig>, };
+export type RunAgentSetupRequest = { executor_profile_id: ExecutorProfileId, };
 
-export type ClaudeCode = { command: CommandBuilder, append_prompt: string | null, plan: boolean, };
+export type RunAgentSetupResponse = Record<string, never>;
 
-export type Gemini = { command: CommandBuilder, append_prompt: string | null, };
+export type RebaseTaskAttemptRequest = { old_base_branch: string | null, new_base_branch: string | null, };
 
-export type Amp = { command: CommandBuilder, append_prompt: string | null, };
+export type GitOperationError = { "type": "merge_conflicts", message: string, op: ConflictOp, } | { "type": "rebase_in_progress" };
 
-export type Codex = { command: CommandBuilder, append_prompt: string | null, };
+export type ReplaceProcessRequest = { 
+/**
+ * Process to replace (delete this and later ones)
+ */
+process_id: string, 
+/**
+ * New prompt to use for the replacement follow-up
+ */
+prompt: string, 
+/**
+ * Optional variant override
+ */
+variant: string | null, 
+/**
+ * If true, allow resetting Git even when uncommitted changes exist
+ */
+force_when_dirty: boolean | null, 
+/**
+ * If false, skip performing the Git reset step (history drop still applies)
+ */
+perform_git_reset: boolean | null, };
 
-export type Cursor = { command: CommandBuilder, append_prompt: string | null, };
+export type CommitInfo = { sha: string, subject: string, };
 
-export type Opencode = { command: CommandBuilder, append_prompt: string | null, };
+export type BranchStatus = { commits_behind: number | null, commits_ahead: number | null, has_uncommitted_changes: boolean | null, head_oid: string | null, uncommitted_count: number | null, untracked_count: number | null, target_branch_name: string, remote_commits_behind: number | null, remote_commits_ahead: number | null, merges: Array<Merge>, 
+/**
+ * True if a `git rebase` is currently in progress in this worktree
+ */
+is_rebase_in_progress: boolean, 
+/**
+ * Current conflict operation if any
+ */
+conflict_op: ConflictOp | null, 
+/**
+ * List of files currently in conflicted (unmerged) state
+ */
+conflicted_files: Array<string>, };
 
-export type CodingAgentInitialRequest = { prompt: string, profile_variant_label: ProfileVariantLabel, };
+export type ConflictOp = "rebase" | "merge" | "cherry_pick" | "revert";
 
-export type CodingAgentFollowUpRequest = { prompt: string, session_id: string, profile_variant_label: ProfileVariantLabel, };
+export type TaskAttempt = { id: string, task_id: string, container_ref: string | null, branch: string, target_branch: string, executor: string, worktree_deleted: boolean, setup_completed_at: string | null, created_at: string, updated_at: string, };
 
-export type CreateTaskAttemptBody = { task_id: string, profile_variant_label: ProfileVariantLabel | null, base_branch: string, };
+export type ExecutionProcess = { id: string, task_attempt_id: string, run_reason: ExecutionProcessRunReason, executor_action: ExecutorAction, 
+/**
+ * Git HEAD commit OID captured before the process starts
+ */
+before_head_commit: string | null, 
+/**
+ * Git HEAD commit OID captured after the process ends
+ */
+after_head_commit: string | null, status: ExecutionProcessStatus, exit_code: bigint | null, 
+/**
+ * dropped: true if this process is excluded from the current
+ * history view (due to restore/trimming). Hidden from logs/timeline;
+ * still listed in the Processes tab.
+ */
+dropped: boolean, started_at: string, completed_at: string | null, created_at: string, updated_at: string, };
 
-export type RebaseTaskAttemptRequest = { new_base_branch: string | null, };
-
-export type BranchStatus = { commits_behind: number | null, commits_ahead: number | null, has_uncommitted_changes: boolean | null, base_branch_name: string, remote_commits_behind: number | null, remote_commits_ahead: number | null, merges: Array<Merge>, };
-
-export type TaskAttempt = { id: string, task_id: string, container_ref: string | null, branch: string | null, base_branch: string, profile: string, worktree_deleted: boolean, setup_completed_at: string | null, created_at: string, updated_at: string, };
-
-export type ExecutionProcess = { id: string, task_attempt_id: string, run_reason: ExecutionProcessRunReason, executor_action: ExecutorAction, status: ExecutionProcessStatus, exit_code: bigint | null, started_at: string, completed_at: string | null, created_at: string, updated_at: string, };
-
-export type ExecutionProcessStatus = "running" | "completed" | "failed" | "killed";
+export enum ExecutionProcessStatus { running = "running", completed = "completed", failed = "failed", killed = "killed" }
 
 export type ExecutionProcessRunReason = "setupscript" | "cleanupscript" | "codingagent" | "devserver";
 
@@ -180,21 +290,17 @@ export type MergeStatus = "open" | "merged" | "closed" | "unknown";
 
 export type PullRequestInfo = { number: bigint, url: string, status: MergeStatus, merged_at: string | null, merge_commit_sha: string | null, };
 
-export type EventPatch = { op: string, path: string, value: EventPatchInner, };
+export type Draft = { id: string, task_attempt_id: string, draft_type: DraftType, retry_process_id: string | null, prompt: string, queued: boolean, sending: boolean, variant: string | null, image_ids: Array<string> | null, created_at: string, updated_at: string, version: bigint, };
 
-export type EventPatchInner = { db_op: string, record: RecordTypes, };
-
-export type RecordTypes = { "type": "TASK", "data": Task } | { "type": "TASK_ATTEMPT", "data": TaskAttempt } | { "type": "EXECUTION_PROCESS", "data": ExecutionProcess } | { "type": "DELETED_TASK", "data": { rowid: bigint, } } | { "type": "DELETED_TASK_ATTEMPT", "data": { rowid: bigint, } } | { "type": "DELETED_EXECUTION_PROCESS", "data": { rowid: bigint, } };
+export type DraftType = "follow_up" | "retry";
 
 export type CommandExitStatus = { "type": "exit_code", code: number, } | { "type": "success", success: boolean, };
 
 export type CommandRunResult = { exit_status: CommandExitStatus | null, output: string | null, };
 
-export type NormalizedConversation = { entries: Array<NormalizedEntry>, session_id: string | null, executor_type: string, prompt: string | null, summary: string | null, };
-
 export type NormalizedEntry = { timestamp: string | null, entry_type: NormalizedEntryType, content: string, };
 
-export type NormalizedEntryType = { "type": "user_message" } | { "type": "assistant_message" } | { "type": "tool_use", tool_name: string, action_type: ActionType, } | { "type": "system_message" } | { "type": "error_message" } | { "type": "thinking" };
+export type NormalizedEntryType = { "type": "user_message" } | { "type": "user_feedback", denied_tool: string, } | { "type": "assistant_message" } | { "type": "tool_use", tool_name: string, action_type: ActionType, status: ToolStatus, } | { "type": "system_message" } | { "type": "error_message", error_type: NormalizedEntryError, } | { "type": "thinking" } | { "type": "loading" } | { "type": "next_action", failed: boolean, execution_processes: number, needs_setup: boolean, };
 
 export type FileChange = { "action": "write", content: string, } | { "action": "delete" } | { "action": "rename", new_path: string, } | { "action": "edit", 
 /**
@@ -210,6 +316,8 @@ export type ActionType = { "action": "file_read", path: string, } | { "action": 
 
 export type TodoItem = { content: string, status: string, priority: string | null, };
 
+export type NormalizedEntryError = { "type": "setup_required" } | { "type": "other" };
+
 export type ToolResult = { type: ToolResultValueType, 
 /**
  * For Markdown, this will be a JSON string; for JSON, a structured value
@@ -218,6 +326,14 @@ value: JsonValue, };
 
 export type ToolResultValueType = { "type": "markdown" } | { "type": "json" };
 
+export type ToolStatus = { "status": "created" } | { "status": "success" } | { "status": "failed" } | { "status": "denied", reason: string | null, } | { "status": "pending_approval", approval_id: string, requested_at: string, timeout_at: string, } | { "status": "timed_out" };
+
 export type PatchType = { "type": "NORMALIZED_ENTRY", "content": NormalizedEntry } | { "type": "STDOUT", "content": string } | { "type": "STDERR", "content": string } | { "type": "DIFF", "content": Diff };
+
+export type ApprovalStatus = { "status": "pending" } | { "status": "approved" } | { "status": "denied", reason?: string, } | { "status": "timed_out" };
+
+export type CreateApprovalRequest = { tool_name: string, tool_input: JsonValue, tool_call_id: string, };
+
+export type ApprovalResponse = { execution_process_id: string, status: ApprovalStatus, };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null;

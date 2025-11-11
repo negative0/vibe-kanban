@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Chivo+Mono:ital,wght@0,100..900;1,100..900&family=Noto+Emoji:wght@300..700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -6,12 +8,13 @@
 @layer base {
   /* Light defaults */
   :root {
+    color-scheme: light;
     --_background: 48 33% 97%;
     --_foreground: 222.2 84% 4.9%;
     --_primary: var(--_muted);
     --_primary-foreground: var(--_muted-foreground);
     --_secondary: var(--_muted);
-    --_secondary-foreground: 215.4 16.3% 46.9%;
+    --_secondary-foreground: 215.4 16.3% 70.9%;
     --_muted: 0 0% 100%;
     --_muted-foreground: var(--_foreground);
     --_accent: var(--_background);
@@ -42,17 +45,18 @@
 
   /* Dark defaults (used if no theme class but user prefers dark) */
   .dark {
-    --_background: 60 2% 18%;
-    --_foreground: 48 7% 95%;
+    color-scheme: dark;
+    --_background: 48 4% 16%;
+    --_foreground: 48 7% 85%;
     --_primary: var(--_muted);
     --_primary-foreground: var(--_muted-foreground);
     --_secondary: var(--_muted);
-    --_secondary-foreground: 48 7% 73%;
-    --_muted: 60 2% 20%;
+    --_secondary-foreground: 48 2% 65%;
+    --_muted: 60 2% 18%;
     --_muted-foreground: var(--_foreground);
     --_accent: var(--_background);
     --_accent-foreground: 210 40% 98%;
-    --_destructive: 0 62.8% 50.6%;
+    --_destructive: 0 45% 55%;
     --_destructive-foreground: var(--_background-foreground);
     --_border: 60 2% 25%;
     --_input: var(--_border);
@@ -89,7 +93,7 @@
 
     --primary: var(--vscode-button-background, var(--_primary));
     --primary-foreground: var(
-      --vscode-button-foreground,
+      --vscode-editor-foreground,
       var(--_primary-foreground)
     );
     --secondary: var(--vscode-input-background, var(--_secondary));
@@ -98,7 +102,7 @@
       var(--_secondary-foreground)
     );
 
-    --muted: var(--vscode-input-background, var(--_muted));
+    --muted: var(--vscode-editor-background, var(--_muted));
     --muted-foreground: var(
       --vscode-descriptionForeground,
       var(--_muted-foreground)
@@ -175,6 +179,10 @@
 
   *:focus {
     @apply ring-inset;
+  }
+
+  .logo {
+    @apply fill-foreground;
   }
 }
 
@@ -254,5 +262,31 @@
 
   .ansi-underline {
     @apply underline;
+  }
+}
+
+/* BASIC STYLES (mainly for rendering markdown) */
+
+@layer base {
+  .wysiwyg {
+    h1 {
+      @apply text-lg leading-tight font-medium;
+    }
+
+    h2 {
+      @apply leading-tight font-medium;
+    }
+
+    ul {
+      @apply list-disc list-outside space-y-1 ps-6;
+    }
+
+    ol {
+      @apply list-decimal list-outside space-y-1 ps-6;
+    }
+
+    li {
+      @apply leading-tight;
+    }
   }
 }

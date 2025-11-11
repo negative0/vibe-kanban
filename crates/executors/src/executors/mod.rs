@@ -1,29 +1,46 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use command_group::AsyncGroupChild;
 use enum_dispatch::enum_dispatch;
 use futures_io::Error as FuturesIoError;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sqlx::Type;
+use strum_macros::{Display, EnumDiscriminants, EnumString, VariantNames};
 use thiserror::Error;
 use ts_rs::TS;
-use utils::msg_store::MsgStore;
+use workspace_utils::msg_store::MsgStore;
 
 use crate::{
+    actions::ExecutorAction,
+    approvals::ExecutorApprovalService,
+    command::CommandBuildError,
     executors::{
-        amp::Amp, claude::ClaudeCode, codex::Codex, cursor::Cursor, gemini::Gemini,
-        opencode::Opencode,
+        amp::Amp, claude::ClaudeCode, codex::Codex, copilot::Copilot, cursor::CursorAgent,
+        gemini::Gemini, opencode::Opencode, qwen::QwenCode,
     },
     mcp_config::McpConfig,
-    profile::{ProfileConfigs, ProfileVariantLabel},
 };
 
+pub mod acp;
 pub mod amp;
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod opencode;
+pub mod qwen;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[ts(use_ts_enum)]
+pub enum BaseAgentCapability {
+    SessionFork,
+    /// Agent requires a setup script before it can run (e.g., login, installation)
+    SetupHelper,
+}
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -41,52 +58,46 @@ pub enum ExecutorError {
     TomlSerialize(#[from] toml::ser::Error),
     #[error(transparent)]
     TomlDeserialize(#[from] toml::de::Error),
+    #[error(transparent)]
+    ExecutorApprovalError(#[from] crate::approvals::ExecutorApprovalError),
+    #[error(transparent)]
+    CommandBuild(#[from] CommandBuildError),
+    #[error("Executable `{program}` not found in PATH")]
+    ExecutableNotFound { program: String },
+    #[error("Setup helper not supported")]
+    SetupHelperNotSupported,
 }
 
 #[enum_dispatch]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, TS, Display, EnumDiscriminants, VariantNames,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[strum_discriminants(
+    name(BaseCodingAgent),
+    // Only add Hash; Eq/PartialEq are already provided by EnumDiscriminants.
+    derive(EnumString, Hash, strum_macros::Display, Serialize, Deserialize, TS, Type),
+    strum(serialize_all = "SCREAMING_SNAKE_CASE"),
+    ts(use_ts_enum),
+    serde(rename_all = "SCREAMING_SNAKE_CASE"),
+    sqlx(type_name = "TEXT", rename_all = "SCREAMING_SNAKE_CASE")
+)]
 pub enum CodingAgent {
     ClaudeCode,
     Amp,
     Gemini,
     Codex,
     Opencode,
-    Cursor,
+    #[serde(alias = "CURSOR")]
+    #[strum_discriminants(serde(alias = "CURSOR"))]
+    #[strum_discriminants(strum(serialize = "CURSOR", serialize = "CURSOR_AGENT"))]
+    CursorAgent,
+    QwenCode,
+    Copilot,
 }
 
 impl CodingAgent {
-    /// Create a CodingAgent from a profile variant
-    /// Loads profile from AgentProfiles (both default and custom profiles)
-    pub fn from_profile_variant_label(
-        profile_variant_label: &ProfileVariantLabel,
-    ) -> Result<Self, ExecutorError> {
-        if let Some(profile_config) =
-            ProfileConfigs::get_cached().get_profile(&profile_variant_label.profile)
-        {
-            if let Some(variant_name) = &profile_variant_label.variant {
-                if let Some(variant) = profile_config.get_variant(variant_name) {
-                    Ok(variant.agent.clone())
-                } else {
-                    Err(ExecutorError::UnknownExecutorType(format!(
-                        "Unknown mode: {variant_name}"
-                    )))
-                }
-            } else {
-                Ok(profile_config.default.agent.clone())
-            }
-        } else {
-            Err(ExecutorError::UnknownExecutorType(format!(
-                "Unknown profile: {}",
-                profile_variant_label.profile
-            )))
-        }
-    }
-
-    pub fn supports_mcp(&self) -> bool {
-        self.default_mcp_config_path().is_some()
-    }
-
     pub fn get_mcp_config(&self) -> McpConfig {
         match self {
             Self::Codex(_) => McpConfig::new(
@@ -94,10 +105,7 @@ impl CodingAgent {
                 serde_json::json!({
                     "mcp_servers": {}
                 }),
-                serde_json::json!({
-                    "command": "npx",
-                    "args": ["-y", "vibe-kanban", "--mcp"],
-                }),
+                self.preconfigured_mcp(),
                 true,
             ),
             Self::Amp(_) => McpConfig::new(
@@ -105,10 +113,7 @@ impl CodingAgent {
                 serde_json::json!({
                     "amp.mcpServers": {}
                 }),
-                serde_json::json!({
-                    "command": "npx",
-                    "args": ["-y", "vibe-kanban", "--mcp"],
-                }),
+                self.preconfigured_mcp(),
                 false,
             ),
             Self::Opencode(_) => McpConfig::new(
@@ -117,11 +122,7 @@ impl CodingAgent {
                     "mcp": {},
                     "$schema": "https://opencode.ai/config.json"
                 }),
-                serde_json::json!({
-                    "type": "local",
-                    "command": ["npx", "-y", "vibe-kanban", "--mcp"],
-                    "enabled": true
-                }),
+                self.preconfigured_mcp(),
                 false,
             ),
             _ => McpConfig::new(
@@ -129,41 +130,25 @@ impl CodingAgent {
                 serde_json::json!({
                     "mcpServers": {}
                 }),
-                serde_json::json!({
-                    "command": "npx",
-                    "args": ["-y", "vibe-kanban", "--mcp"],
-                }),
+                self.preconfigured_mcp(),
                 false,
             ),
         }
     }
 
-    pub fn default_mcp_config_path(&self) -> Option<PathBuf> {
+    pub fn supports_mcp(&self) -> bool {
+        self.default_mcp_config_path().is_some()
+    }
+
+    pub fn capabilities(&self) -> Vec<BaseAgentCapability> {
         match self {
-            //ExecutorConfig::CharmOpencode => {
-            //dirs::home_dir().map(|home| home.join(".opencode.json"))
-            //}
-            Self::ClaudeCode(_) => dirs::home_dir().map(|home| home.join(".claude.json")),
-            //ExecutorConfig::ClaudePlan => dirs::home_dir().map(|home| home.join(".claude.json")),
-            Self::Opencode(_) => {
-                #[cfg(unix)]
-                {
-                    xdg::BaseDirectories::with_prefix("opencode").get_config_file("opencode.json")
-                }
-                #[cfg(not(unix))]
-                {
-                    dirs::config_dir().map(|config| config.join("opencode").join("opencode.json"))
-                }
-            }
-            //ExecutorConfig::Aider => None,
-            Self::Codex(_) => dirs::home_dir().map(|home| home.join(".codex").join("config.toml")),
-            Self::Amp(_) => {
-                dirs::config_dir().map(|config| config.join("amp").join("settings.json"))
-            }
-            Self::Gemini(_) => {
-                dirs::home_dir().map(|home| home.join(".gemini").join("settings.json"))
-            }
-            Self::Cursor(_) => dirs::home_dir().map(|home| home.join(".cursor").join("mcp.json")),
+            Self::ClaudeCode(_) => vec![BaseAgentCapability::SessionFork],
+            Self::Amp(_) => vec![BaseAgentCapability::SessionFork],
+            Self::Codex(_) => vec![BaseAgentCapability::SessionFork],
+            Self::Gemini(_) => vec![BaseAgentCapability::SessionFork],
+            Self::QwenCode(_) => vec![BaseAgentCapability::SessionFork],
+            Self::CursorAgent(_) => vec![BaseAgentCapability::SetupHelper],
+            Self::Opencode(_) | Self::Copilot(_) => vec![],
         }
     }
 }
@@ -171,16 +156,103 @@ impl CodingAgent {
 #[async_trait]
 #[enum_dispatch(CodingAgent)]
 pub trait StandardCodingAgentExecutor {
-    async fn spawn(
-        &self,
-        current_dir: &PathBuf,
-        prompt: &str,
-    ) -> Result<AsyncGroupChild, ExecutorError>;
+    fn use_approvals(&mut self, _approvals: Arc<dyn ExecutorApprovalService>) {}
+
+    async fn spawn(&self, current_dir: &Path, prompt: &str) -> Result<SpawnedChild, ExecutorError>;
     async fn spawn_follow_up(
         &self,
-        current_dir: &PathBuf,
+        current_dir: &Path,
         prompt: &str,
         session_id: &str,
-    ) -> Result<AsyncGroupChild, ExecutorError>;
-    fn normalize_logs(&self, _raw_logs_event_store: Arc<MsgStore>, _worktree_path: &PathBuf);
+    ) -> Result<SpawnedChild, ExecutorError>;
+    fn normalize_logs(&self, _raw_logs_event_store: Arc<MsgStore>, _worktree_path: &Path);
+
+    // MCP configuration methods
+    fn default_mcp_config_path(&self) -> Option<std::path::PathBuf>;
+
+    async fn get_setup_helper_action(&self) -> Result<ExecutorAction, ExecutorError> {
+        Err(ExecutorError::SetupHelperNotSupported)
+    }
+
+    async fn check_availability(&self) -> bool {
+        self.default_mcp_config_path()
+            .map(|path| path.exists())
+            .unwrap_or(false)
+    }
+}
+
+/// Optional exit notification from an executor.
+/// When this receiver resolves, the container should gracefully stop the process
+/// and mark it as successful (exit code 0).
+pub type ExecutorExitSignal = tokio::sync::oneshot::Receiver<()>;
+
+#[derive(Debug)]
+pub struct SpawnedChild {
+    pub child: AsyncGroupChild,
+    pub exit_signal: Option<ExecutorExitSignal>,
+}
+
+impl From<AsyncGroupChild> for SpawnedChild {
+    fn from(child: AsyncGroupChild) -> Self {
+        Self {
+            child,
+            exit_signal: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, JsonSchema)]
+#[serde(transparent)]
+#[schemars(
+    title = "Append Prompt",
+    description = "Extra text appended to the prompt",
+    extend("format" = "textarea")
+)]
+#[derive(Default)]
+pub struct AppendPrompt(pub Option<String>);
+
+impl AppendPrompt {
+    pub fn get(&self) -> Option<String> {
+        self.0.clone()
+    }
+
+    pub fn combine_prompt(&self, prompt: &str) -> String {
+        match self {
+            AppendPrompt(Some(value)) => format!("{prompt}{value}"),
+            AppendPrompt(None) => prompt.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn test_cursor_agent_deserialization() {
+        // Test that CURSOR_AGENT is accepted
+        let result = BaseCodingAgent::from_str("CURSOR_AGENT");
+        assert!(result.is_ok(), "CURSOR_AGENT should be valid");
+        assert_eq!(result.unwrap(), BaseCodingAgent::CursorAgent);
+
+        // Test that legacy CURSOR is still accepted for backwards compatibility
+        let result = BaseCodingAgent::from_str("CURSOR");
+        assert!(
+            result.is_ok(),
+            "CURSOR should be valid for backwards compatibility"
+        );
+        assert_eq!(result.unwrap(), BaseCodingAgent::CursorAgent);
+
+        // Test serde deserialization for CURSOR_AGENT
+        let result: Result<BaseCodingAgent, _> = serde_json::from_str(r#""CURSOR_AGENT""#);
+        assert!(result.is_ok(), "CURSOR_AGENT should deserialize via serde");
+        assert_eq!(result.unwrap(), BaseCodingAgent::CursorAgent);
+
+        // Test serde deserialization for legacy CURSOR
+        let result: Result<BaseCodingAgent, _> = serde_json::from_str(r#""CURSOR""#);
+        assert!(result.is_ok(), "CURSOR should deserialize via serde");
+        assert_eq!(result.unwrap(), BaseCodingAgent::CursorAgent);
+    }
 }

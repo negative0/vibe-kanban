@@ -5,19 +5,22 @@ import {
   DiffLineType,
   parseInstance,
 } from '@git-diff-view/react';
-import { ThemeMode } from 'shared/types';
-import { ChevronRight, ChevronUp } from 'lucide-react';
-import { Button } from '@/components/ui/button';
-import { useConfig } from '@/components/config-provider';
+import { SquarePen } from 'lucide-react';
+import { useUserSystem } from '@/components/config-provider';
 import { getHighLightLanguageFromPath } from '@/utils/extToLanguage';
+import { getActualTheme } from '@/utils/theme';
 import '@/styles/diff-style-overrides.css';
 import '@/styles/edit-diff-overrides.css';
+import { cn } from '@/lib/utils';
 
 type Props = {
   path: string;
   unifiedDiff: string;
   hasLineNumbers: boolean;
   expansionKey: string;
+  defaultExpanded?: boolean;
+  statusAppearance?: 'default' | 'denied' | 'timed_out';
+  forceExpanded?: boolean;
 };
 
 /**
@@ -63,15 +66,15 @@ function EditDiffRenderer({
   unifiedDiff,
   hasLineNumbers,
   expansionKey,
+  defaultExpanded = false,
+  statusAppearance = 'default',
+  forceExpanded = false,
 }: Props) {
-  const { config } = useConfig();
-  const [expanded, setExpanded] = useExpandable(expansionKey, false);
+  const { config } = useUserSystem();
+  const [expanded, setExpanded] = useExpandable(expansionKey, defaultExpanded);
+  const effectiveExpanded = forceExpanded || expanded;
 
-  let theme: 'light' | 'dark' | undefined = 'light';
-  if (config?.theme === ThemeMode.DARK) {
-    theme = 'dark';
-  }
-
+  const theme = getActualTheme(config?.theme);
   const { hunks, hideLineNumbers, additions, deletions, isValidDiff } = useMemo(
     () => processUnifiedDiff(unifiedDiff, hasLineNumbers),
     [path, unifiedDiff, hasLineNumbers]
@@ -88,26 +91,19 @@ function EditDiffRenderer({
     };
   }, [hunks, path]);
 
+  const headerClass = cn(
+    'flex items-center gap-1.5 text-secondary-foreground',
+    statusAppearance === 'denied' && 'text-red-700 dark:text-red-300',
+    statusAppearance === 'timed_out' && 'text-amber-700 dark:text-amber-200'
+  );
+
   return (
-    <div className="my-4 border">
-      <div className="flex items-center px-4 py-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => setExpanded()}
-          className="h-6 w-6 p-0 mr-2"
-          title={expanded ? 'Collapse' : 'Expand'}
-          aria-expanded={expanded}
-        >
-          {expanded ? (
-            <ChevronUp className="h-3 w-3" />
-          ) : (
-            <ChevronRight className="h-3 w-3" />
-          )}
-        </Button>
+    <div>
+      <div className={headerClass}>
+        <SquarePen className="h-3 w-3" />
         <p
-          className="text-xs font-mono overflow-x-auto flex-1"
-          style={{ color: 'hsl(var(--muted-foreground) / 0.7)' }}
+          onClick={() => setExpanded()}
+          className="text-sm font-mono overflow-x-auto flex-1 cursor-pointer"
         >
           {path}{' '}
           <span style={{ color: 'hsl(var(--console-success))' }}>
@@ -119,8 +115,8 @@ function EditDiffRenderer({
         </p>
       </div>
 
-      {expanded && (
-        <div className={'mt-2' + hideLineNumbersClass}>
+      {effectiveExpanded && (
+        <div className={'mt-2 border ' + hideLineNumbersClass}>
           {isValidDiff ? (
             <DiffView
               data={diffData}

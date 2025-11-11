@@ -1,7 +1,7 @@
 [package]
 name = "server"
-version = "0.0.70"
-edition = "2021"
+version = "0.0.116"
+edition = "2024"
 default-run = "server"
 
 [lints.clippy]
@@ -15,6 +15,7 @@ utils = { path = "../utils" }
 db = { path = "../db" }
 services = { path = "../services" }
 tokio = { workspace = true }
+shlex = "1.3.0"
 tokio-util = { version = "0.7", features = ["io"] }
 axum = { workspace = true }
 serde = { workspace = true }
@@ -22,20 +23,18 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "sqlite-preupdate-hook", "chrono", "uuid"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4", "serde"] }
-ts-rs = { workspace = true, features = ["serde-json-impl"]}
+ts-rs = { workspace = true }
 async-trait = "0.1"
 command-group = { version = "5.0", features = ["with-tokio"] }
 nix = { version = "0.29", features = ["signal", "process"] }
 openssl-sys = { workspace = true }
 rmcp = { version = "0.5.0", features = ["server", "transport-io"] }
-schemars = "0.8"
+schemars = { workspace = true }
 regex = "1.11.1"
 toml = "0.8"
-sentry = { version = "0.41.0", features = ["anyhow", "backtrace", "panic", "debug-images"] }
-sentry-tracing = { version = "0.41.0", features = ["backtrace"] }
 reqwest = { version = "0.12", features = ["json"] }
 strip-ansi-escapes = "0.2.1"
 thiserror = { workspace = true }

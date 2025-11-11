@@ -8,12 +8,14 @@ use db::{
         task_attempt::{TaskAttempt, TaskAttemptError},
     },
 };
+use serde_json::json;
 use sqlx::error::Error as SqlxError;
 use thiserror::Error;
 use tokio::{sync::RwLock, time::interval};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::services::{
+    analytics::AnalyticsContext,
     config::Config,
     github_service::{GitHubRepoInfo, GitHubService, GitHubServiceError},
 };
@@ -35,14 +37,20 @@ pub struct PrMonitorService {
     db: DBService,
     config: Arc<RwLock<Config>>,
     poll_interval: Duration,
+    analytics: Option<AnalyticsContext>,
 }
 
 impl PrMonitorService {
-    pub async fn spawn(db: DBService, config: Arc<RwLock<Config>>) -> tokio::task::JoinHandle<()> {
+    pub async fn spawn(
+        db: DBService,
+        config: Arc<RwLock<Config>>,
+        analytics: Option<AnalyticsContext>,
+    ) -> tokio::task::JoinHandle<()> {
         let service = Self {
             db,
             config,
             poll_interval: Duration::from_secs(60), // Check every minute
+            analytics,
         };
         tokio::spawn(async move {
             service.start().await;
@@ -77,11 +85,17 @@ impl PrMonitorService {
         info!("Checking {} open PRs", open_prs.len());
 
         for pr_merge in open_prs {
-            if let Err(e) = self.check_pr_status(&pr_merge).await {
-                error!(
-                    "Error checking PR #{} for attempt {}: {}",
-                    pr_merge.pr_info.number, pr_merge.task_attempt_id, e
-                );
+            match self.check_pr_status(&pr_merge).await {
+                Err(PrMonitorError::NoGitHubToken) => {
+                    warn!("No GitHub token configured, cannot check PR status");
+                }
+                Err(e) => {
+                    error!(
+                        "Error checking PR #{} for attempt {}: {}",
+                        pr_merge.pr_info.number, pr_merge.task_attempt_id, e
+                    );
+                }
+                Ok(_) => {}
             }
         }
         Ok(())
@@ -94,7 +108,7 @@ impl PrMonitorService {
 
         let github_service = GitHubService::new(&github_token)?;
 
-        let repo_info = GitHubRepoInfo::from_pr_url(&pr_merge.pr_info.url)?;
+        let repo_info = GitHubRepoInfo::from_remote_url(&pr_merge.pr_info.url)?;
 
         let pr_status = github_service
             .update_pr_status(&repo_info, pr_merge.pr_info.number)
@@ -126,6 +140,22 @@ impl PrMonitorService {
                     pr_merge.pr_info.number, task_attempt.task_id
                 );
                 Task::update_status(&self.db.pool, task_attempt.task_id, TaskStatus::Done).await?;
+
+                // Track analytics event
+                if let Some(analytics) = &self.analytics
+                    && let Ok(Some(task)) =
+                        Task::find_by_id(&self.db.pool, task_attempt.task_id).await
+                {
+                    analytics.analytics_service.track_event(
+                        &analytics.user_id,
+                        "pr_merged",
+                        Some(json!({
+                            "task_id": task_attempt.task_id.to_string(),
+                            "task_attempt_id": task_attempt.id.to_string(),
+                            "project_id": task.project_id.to_string(),
+                        })),
+                    );
+                }
             }
         }
 

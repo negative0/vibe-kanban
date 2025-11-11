@@ -1,23 +1,23 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicUsize},
     time::Duration,
 };
 
 use anyhow::anyhow;
-use async_stream::try_stream;
 use async_trait::async_trait;
-use axum::response::sse::Event;
 use command_group::AsyncGroupChild;
 use db::{
     DBService,
     models::{
+        draft::{Draft, DraftType},
         execution_process::{
             ExecutionContext, ExecutionProcess, ExecutionProcessRunReason, ExecutionProcessStatus,
         },
         executor_session::ExecutorSession,
+        image::TaskImage,
         merge::Merge,
         project::Project,
         task::{Task, TaskStatus},
@@ -27,20 +27,25 @@ use db::{
 use deployment::DeploymentError;
 use executors::{
     actions::{Executable, ExecutorAction},
+    approvals::{ExecutorApprovalService, NoopExecutorApprovalService},
+    executors::BaseCodingAgent,
     logs::{
-        NormalizedEntry, NormalizedEntryType,
-        utils::{ConversationPatch, patch::escape_json_pointer_segment},
+        NormalizedEntryType,
+        utils::{
+            ConversationPatch,
+            patch::{escape_json_pointer_segment, extract_normalized_entry_from_patch},
+        },
     },
 };
-use futures::{StreamExt, TryStreamExt, stream::select};
-use notify_debouncer_full::DebouncedEvent;
+use futures::{FutureExt, StreamExt, TryStreamExt, stream::select};
 use serde_json::json;
 use services::services::{
     analytics::AnalyticsContext,
+    approvals::{Approvals, executor_approvals::ExecutorApprovalBridge},
     config::Config,
     container::{ContainerError, ContainerRef, ContainerService},
-    filesystem_watcher,
-    git::{DiffTarget, GitService},
+    diff_stream::{self, DiffStreamHandle},
+    git::{Commit, DiffTarget, GitService},
     image::ImageService,
     notification::NotificationService,
     worktree_manager::WorktreeManager,
@@ -65,6 +70,7 @@ pub struct LocalContainerService {
     git: GitService,
     image_service: ImageService,
     analytics: Option<AnalyticsContext>,
+    approvals: Approvals,
 }
 
 impl LocalContainerService {
@@ -75,6 +81,7 @@ impl LocalContainerService {
         git: GitService,
         image_service: ImageService,
         analytics: Option<AnalyticsContext>,
+        approvals: Approvals,
     ) -> Self {
         let child_store = Arc::new(RwLock::new(HashMap::new()));
 
@@ -86,6 +93,7 @@ impl LocalContainerService {
             git,
             image_service,
             analytics,
+            approvals,
         }
     }
 
@@ -283,7 +291,11 @@ impl LocalContainerService {
 
     /// Spawn a background task that polls the child process for completion and
     /// cleans up the execution entry when it exits.
-    pub fn spawn_exit_monitor(&self, exec_id: &Uuid) -> JoinHandle<()> {
+    pub fn spawn_exit_monitor(
+        &self,
+        exec_id: &Uuid,
+        exit_signal: Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> JoinHandle<()> {
         let exec_id = *exec_id;
         let child_store = self.child_store.clone();
         let msg_stores = self.msg_stores.clone();
@@ -292,157 +304,213 @@ impl LocalContainerService {
         let container = self.clone();
         let analytics = self.analytics.clone();
 
+        let mut process_exit_rx = self.spawn_os_exit_watcher(exec_id);
+
         tokio::spawn(async move {
-            loop {
-                let status_opt = {
-                    let child_lock = {
-                        let map = child_store.read().await;
-                        map.get(&exec_id)
-                            .cloned()
-                            .unwrap_or_else(|| panic!("Child handle missing for {exec_id}"))
+            let mut exit_signal_future = exit_signal
+                .map(|rx| rx.map(|_| ()).boxed()) // wait for signal
+                .unwrap_or_else(|| std::future::pending::<()>().boxed()); // no signal, stall forever
+
+            let status_result: std::io::Result<std::process::ExitStatus>;
+
+            // Wait for process to exit, or exit signal from executor
+            tokio::select! {
+                // Exit signal.
+                // Some coding agent processes do not automatically exit after processing the user request; instead the executor
+                // signals when processing has finished to gracefully kill the process.
+                _ = &mut exit_signal_future => {
+                    // Executor signaled completion: kill group and remember to force Completed(0)
+                    if let Some(child_lock) = child_store.read().await.get(&exec_id).cloned() {
+                        let mut child = child_lock.write().await ;
+                        if let Err(err) = command::kill_process_group(&mut child).await {
+                            tracing::error!("Failed to kill process group after exit signal: {} {}", exec_id, err);
+                        }
+                    }
+                    status_result = Ok(success_exit_status());
+                }
+                // Process exit
+                exit_status_result = &mut process_exit_rx => {
+                    status_result = exit_status_result.unwrap_or_else(|e| Err(std::io::Error::other(e)));
+                }
+            }
+
+            let (exit_code, status) = match status_result {
+                Ok(exit_status) => {
+                    let code = exit_status.code().unwrap_or(-1) as i64;
+                    let status = if exit_status.success() {
+                        ExecutionProcessStatus::Completed
+                    } else {
+                        ExecutionProcessStatus::Failed
                     };
+                    (Some(code), status)
+                }
+                Err(_) => (None, ExecutionProcessStatus::Failed),
+            };
 
-                    let mut child_handler = child_lock.write().await;
-                    match child_handler.try_wait() {
-                        Ok(Some(status)) => Some(Ok(status)),
-                        Ok(None) => None,
-                        Err(e) => Some(Err(e)),
-                    }
-                };
+            if !ExecutionProcess::was_stopped(&db.pool, exec_id).await
+                && let Err(e) =
+                    ExecutionProcess::update_completion(&db.pool, exec_id, status, exit_code).await
+            {
+                tracing::error!("Failed to update execution process completion: {}", e);
+            }
 
-                // Update execution process and cleanup if exit
-                if let Some(status_result) = status_opt {
-                    // Update execution process record with completion info
-                    let (exit_code, status) = match status_result {
-                        Ok(exit_status) => {
-                            let code = exit_status.code().unwrap_or(-1) as i64;
-                            let status = if exit_status.success() {
-                                ExecutionProcessStatus::Completed
-                            } else {
-                                ExecutionProcessStatus::Failed
-                            };
-                            (Some(code), status)
-                        }
-                        Err(_) => (None, ExecutionProcessStatus::Failed),
-                    };
-
-                    if !ExecutionProcess::was_killed(&db.pool, exec_id).await
-                        && let Err(e) = ExecutionProcess::update_completion(
-                            &db.pool,
-                            exec_id,
-                            status.clone(),
-                            exit_code,
-                        )
-                        .await
-                    {
-                        tracing::error!("Failed to update execution process completion: {}", e);
-                    }
-
-                    if let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await {
-                        // Update executor session summary if available
-                        if let Err(e) = container.update_executor_session_summary(&exec_id).await {
-                            tracing::warn!("Failed to update executor session summary: {}", e);
-                        }
-
-                        if matches!(
-                            ctx.execution_process.status,
-                            ExecutionProcessStatus::Completed
-                        ) && exit_code == Some(0)
-                        {
-                            // Commit changes (if any) and get feedback about whether changes were made
-                            let changes_committed = match container.try_commit_changes(&ctx).await {
-                                Ok(committed) => committed,
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to commit changes after execution: {}",
-                                        e
-                                    );
-                                    // Treat commit failures as if changes were made to be safe
-                                    true
-                                }
-                            };
-
-                            // Determine whether to start the next action based on execution context
-                            let should_start_next = if matches!(
-                                ctx.execution_process.run_reason,
-                                ExecutionProcessRunReason::CodingAgent
-                            ) {
-                                // Skip CleanupScript when CodingAgent produced no changes
-                                changes_committed
-                            } else {
-                                // SetupScript always proceeds to CodingAgent
-                                true
-                            };
-
-                            if should_start_next {
-                                // If the process exited successfully, start the next action
-                                if let Err(e) = container.try_start_next_action(&ctx).await {
-                                    tracing::error!(
-                                        "Failed to start next action after completion: {}",
-                                        e
-                                    );
-                                }
-                            } else {
-                                tracing::info!(
-                                    "Skipping cleanup script for task attempt {} - no changes made by coding agent",
-                                    ctx.task_attempt.id
-                                );
-
-                                // Manually finalize task since we're bypassing normal execution flow
-                                Self::finalize_task(&db, &config, &ctx).await;
-                            }
-                        }
-
-                        if Self::should_finalize(&ctx) {
-                            Self::finalize_task(&db, &config, &ctx).await;
-                        }
-
-                        // Fire event when CodingAgent execution has finished
-                        if config.read().await.analytics_enabled == Some(true)
-                            && matches!(
-                                &ctx.execution_process.run_reason,
-                                ExecutionProcessRunReason::CodingAgent
-                            )
-                            && let Some(analytics) = &analytics
-                        {
-                            analytics.analytics_service.track_event(&analytics.user_id, "task_attempt_finished", Some(json!({
-                                    "task_id": ctx.task.id.to_string(),
-                                    "project_id": ctx.task.project_id.to_string(),
-                                    "attempt_id": ctx.task_attempt.id.to_string(),
-                                    "execution_success": matches!(ctx.execution_process.status, ExecutionProcessStatus::Completed),
-                                    "exit_code": ctx.execution_process.exit_code,
-                                })));
-                        }
-                    }
-
-                    // Cleanup msg store
-                    if let Some(msg_arc) = msg_stores.write().await.remove(&exec_id) {
-                        msg_arc.push_finished();
-                        tokio::time::sleep(Duration::from_millis(50)).await; // Wait for the finish message to propogate
-                        match Arc::try_unwrap(msg_arc) {
-                            Ok(inner) => drop(inner),
-                            Err(arc) => tracing::error!(
-                                "There are still {} strong Arcs to MsgStore for {}",
-                                Arc::strong_count(&arc),
-                                exec_id
-                            ),
-                        }
-                    }
-
-                    // Cleanup child handle
-                    child_store.write().await.remove(&exec_id);
-                    break;
+            if let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await {
+                // Update executor session summary if available
+                if let Err(e) = container.update_executor_session_summary(&exec_id).await {
+                    tracing::warn!("Failed to update executor session summary: {}", e);
                 }
 
-                // still running, sleep and try again
+                let success = matches!(
+                    ctx.execution_process.status,
+                    ExecutionProcessStatus::Completed
+                ) && exit_code == Some(0);
+
+                let cleanup_done = matches!(
+                    ctx.execution_process.run_reason,
+                    ExecutionProcessRunReason::CleanupScript
+                ) && !matches!(
+                    ctx.execution_process.status,
+                    ExecutionProcessStatus::Running
+                );
+
+                if success || cleanup_done {
+                    // Commit changes (if any) and get feedback about whether changes were made
+                    let changes_committed = match container.try_commit_changes(&ctx).await {
+                        Ok(committed) => committed,
+                        Err(e) => {
+                            tracing::error!("Failed to commit changes after execution: {}", e);
+                            // Treat commit failures as if changes were made to be safe
+                            true
+                        }
+                    };
+
+                    let should_start_next = if matches!(
+                        ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::CodingAgent
+                    ) {
+                        changes_committed
+                    } else {
+                        true
+                    };
+
+                    if should_start_next {
+                        // If the process exited successfully, start the next action
+                        if let Err(e) = container.try_start_next_action(&ctx).await {
+                            tracing::error!("Failed to start next action after completion: {}", e);
+                        }
+                    } else {
+                        tracing::info!(
+                            "Skipping cleanup script for task attempt {} - no changes made by coding agent",
+                            ctx.task_attempt.id
+                        );
+
+                        // Manually finalize task since we're bypassing normal execution flow
+                        Self::finalize_task(&db, &config, &ctx).await;
+                    }
+                }
+
+                if Self::should_finalize(&ctx) {
+                    Self::finalize_task(&db, &config, &ctx).await;
+                    // After finalization, check if a queued follow-up exists and start it
+                    if let Err(e) = container.try_consume_queued_followup(&ctx).await {
+                        tracing::error!(
+                            "Failed to start queued follow-up for attempt {}: {}",
+                            ctx.task_attempt.id,
+                            e
+                        );
+                    }
+                }
+
+                // Fire analytics event when CodingAgent execution has finished
+                if config.read().await.analytics_enabled == Some(true)
+                    && matches!(
+                        &ctx.execution_process.run_reason,
+                        ExecutionProcessRunReason::CodingAgent
+                    )
+                    && let Some(analytics) = &analytics
+                {
+                    analytics.analytics_service.track_event(&analytics.user_id, "task_attempt_finished", Some(json!({
+                        "task_id": ctx.task.id.to_string(),
+                        "project_id": ctx.task.project_id.to_string(),
+                        "attempt_id": ctx.task_attempt.id.to_string(),
+                        "execution_success": matches!(ctx.execution_process.status, ExecutionProcessStatus::Completed),
+                        "exit_code": ctx.execution_process.exit_code,
+                    })));
+                }
+            }
+
+            // Now that commit/next-action/finalization steps for this process are complete,
+            // capture the HEAD OID as the definitive "after" state (best-effort).
+            if let Ok(ctx) = ExecutionProcess::load_context(&db.pool, exec_id).await {
+                let worktree_dir = container.task_attempt_to_current_dir(&ctx.task_attempt);
+                if let Ok(head) = container.git().get_head_info(&worktree_dir)
+                    && let Err(e) =
+                        ExecutionProcess::update_after_head_commit(&db.pool, exec_id, &head.oid)
+                            .await
+                {
+                    tracing::warn!("Failed to update after_head_commit for {}: {}", exec_id, e);
+                }
+            }
+
+            // Cleanup msg store
+            if let Some(msg_arc) = msg_stores.write().await.remove(&exec_id) {
+                msg_arc.push_finished();
+                tokio::time::sleep(Duration::from_millis(50)).await; // Wait for the finish message to propogate
+                match Arc::try_unwrap(msg_arc) {
+                    Ok(inner) => drop(inner),
+                    Err(arc) => tracing::error!(
+                        "There are still {} strong Arcs to MsgStore for {}",
+                        Arc::strong_count(&arc),
+                        exec_id
+                    ),
+                }
+            }
+
+            // Cleanup child handle
+            child_store.write().await.remove(&exec_id);
+        })
+    }
+
+    pub fn spawn_os_exit_watcher(
+        &self,
+        exec_id: Uuid,
+    ) -> tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<std::process::ExitStatus>>();
+        let child_store = self.child_store.clone();
+        tokio::spawn(async move {
+            loop {
+                let child_lock = {
+                    let map = child_store.read().await;
+                    map.get(&exec_id).cloned()
+                };
+                if let Some(child_lock) = child_lock {
+                    let mut child_handler = child_lock.write().await;
+                    match child_handler.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = tx.send(Ok(status));
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = tx.send(Err(io::Error::other(format!(
+                        "Child handle missing for {exec_id}"
+                    ))));
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-        })
+        });
+        rx
     }
 
     pub fn dir_name_from_task_attempt(attempt_id: &Uuid, task_title: &str) -> String {
         let task_title_id = git_branch_id(task_title);
-        format!("vk-{}-{}", short_uuid(attempt_id), task_title_id)
+        format!("{}-{}", short_uuid(attempt_id), task_title_id)
     }
 
     async fn track_child_msgs_in_store(&self, id: Uuid, child: &mut AsyncGroupChild) {
@@ -463,13 +531,15 @@ impl LocalContainerService {
 
         // Merge and forward into the store
         let merged = select(out, err); // Stream<Item = Result<LogMsg, io::Error>>
-        store.clone().spawn_forwarder(merged);
+        let debounced = utils::stream_ext::debounce_logs(merged);
+        store.clone().spawn_forwarder(debounced);
 
         let mut map = self.msg_stores().write().await;
         map.insert(id, store);
     }
 
     /// Get the worktree path for a task attempt
+    #[allow(dead_code)]
     async fn get_worktree_path(
         &self,
         task_attempt: &TaskAttempt,
@@ -485,7 +555,6 @@ impl LocalContainerService {
 
         Ok(worktree_dir)
     }
-
     /// Get the project repository path for a task attempt
     async fn get_project_repo_path(
         &self,
@@ -503,13 +572,13 @@ impl LocalContainerService {
         Ok(project_repo_path)
     }
 
-    /// Create a diff stream for merged attempts (never changes)
+    /// Create a diff log stream for merged attempts (never changes) for WebSocket
     fn create_merged_diff_stream(
         &self,
         project_repo_path: &Path,
         merge_commit_id: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<Event, std::io::Error>>, ContainerError>
-    {
+        stats_only: bool,
+    ) -> Result<DiffStreamHandle, ContainerError> {
         let diffs = self.git().get_diffs(
             DiffTarget::Commit {
                 repo_path: project_repo_path,
@@ -518,164 +587,58 @@ impl LocalContainerService {
             None,
         )?;
 
+        let cum = Arc::new(AtomicUsize::new(0));
+        let diffs: Vec<_> = diffs
+            .into_iter()
+            .map(|mut d| {
+                diff_stream::apply_stream_omit_policy(&mut d, &cum, stats_only);
+                d
+            })
+            .collect();
+
         let stream = futures::stream::iter(diffs.into_iter().map(|diff| {
             let entry_index = GitService::diff_path(&diff);
             let patch =
                 ConversationPatch::add_diff(escape_json_pointer_segment(&entry_index), diff);
-            let event = LogMsg::JsonPatch(patch).to_sse_event();
-            Ok::<_, std::io::Error>(event)
+            Ok::<_, std::io::Error>(LogMsg::JsonPatch(patch))
         }))
         .chain(futures::stream::once(async {
-            Ok::<_, std::io::Error>(LogMsg::Finished.to_sse_event())
+            Ok::<_, std::io::Error>(LogMsg::Finished)
         }))
         .boxed();
 
-        Ok(stream)
+        Ok(diff_stream::DiffStreamHandle::new(stream, None))
     }
 
-    /// Create a live diff stream for ongoing attempts
+    /// Create a live diff log stream for ongoing attempts for WebSocket
+    /// Returns a stream that owns the filesystem watcher - when dropped, watcher is cleaned up
     async fn create_live_diff_stream(
         &self,
-        project_repo_path: &Path,
         worktree_path: &Path,
-        task_branch: &str,
-        base_branch: &str,
-    ) -> Result<futures::stream::BoxStream<'static, Result<Event, std::io::Error>>, ContainerError>
+        base_commit: &Commit,
+        stats_only: bool,
+    ) -> Result<DiffStreamHandle, ContainerError> {
+        diff_stream::create(
+            self.git().clone(),
+            worktree_path.to_path_buf(),
+            base_commit.clone(),
+            stats_only,
+        )
+        .await
+        .map_err(|e| ContainerError::Other(anyhow!("{e}")))
+    }
+}
+
+fn success_exit_status() -> std::process::ExitStatus {
+    #[cfg(unix)]
     {
-        // Get initial snapshot
-        let git_service = self.git().clone();
-        let initial_diffs = git_service.get_diffs(
-            DiffTarget::Worktree {
-                worktree_path,
-                branch_name: task_branch,
-                base_branch,
-            },
-            None,
-        )?;
-
-        let initial_stream = futures::stream::iter(initial_diffs.into_iter().map(|diff| {
-            let entry_index = GitService::diff_path(&diff);
-            let patch =
-                ConversationPatch::add_diff(escape_json_pointer_segment(&entry_index), diff);
-            let event = LogMsg::JsonPatch(patch).to_sse_event();
-            Ok::<_, std::io::Error>(event)
-        }))
-        .boxed();
-
-        // Create live update stream
-        let project_repo_path = project_repo_path.to_path_buf();
-        let worktree_path = worktree_path.to_path_buf();
-        let task_branch = task_branch.to_string();
-        let base_branch = base_branch.to_string();
-
-        let live_stream = {
-            let git_service = git_service.clone();
-            try_stream! {
-                let (_debouncer, mut rx, canonical_worktree_path) =
-                    filesystem_watcher::async_watcher(worktree_path.clone())
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-
-                while let Some(result) = rx.next().await {
-                    match result {
-                        Ok(events) => {
-                            let changed_paths = Self::extract_changed_paths(&events, &canonical_worktree_path, &worktree_path);
-
-                            if !changed_paths.is_empty() {
-                                for event in Self::process_file_changes(
-                                    &git_service,
-                                    &project_repo_path,
-                                    &worktree_path,
-                                    &task_branch,
-                                    &base_branch,
-                                    &changed_paths,
-                                ).map_err(|e| {
-                                    tracing::error!("Error processing file changes: {}", e);
-                                    io::Error::other(e.to_string())
-                                })? {
-                                    yield event;
-                                }
-                            }
-                        }
-                        Err(errors) => {
-                            let error_msg = errors.iter()
-                                .map(|e| e.to_string())
-                                .collect::<Vec<_>>()
-                                .join("; ");
-                            tracing::error!("Filesystem watcher error: {}", error_msg);
-                            Err(io::Error::other(error_msg))?;
-                        }
-                    }
-                }
-            }
-        }.boxed();
-
-        let combined_stream = select(initial_stream, live_stream);
-        Ok(combined_stream.boxed())
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatusExt::from_raw(0)
     }
-
-    /// Extract changed file paths from filesystem events
-    fn extract_changed_paths(
-        events: &[DebouncedEvent],
-        canonical_worktree_path: &Path,
-        worktree_path: &Path,
-    ) -> Vec<String> {
-        events
-            .iter()
-            .flat_map(|event| &event.paths)
-            .filter_map(|path| {
-                path.strip_prefix(canonical_worktree_path)
-                    .or_else(|_| path.strip_prefix(worktree_path))
-                    .ok()
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-            })
-            .filter(|s| !s.is_empty())
-            .collect()
-    }
-
-    /// Process file changes and generate diff events
-    fn process_file_changes(
-        git_service: &GitService,
-        project_repo_path: &Path,
-        worktree_path: &Path,
-        task_branch: &str,
-        base_branch: &str,
-        changed_paths: &[String],
-    ) -> Result<Vec<Event>, ContainerError> {
-        let path_filter: Vec<&str> = changed_paths.iter().map(|s| s.as_str()).collect();
-
-        let current_diffs = git_service.get_diffs(
-            DiffTarget::Worktree {
-                worktree_path,
-                branch_name: task_branch,
-                base_branch,
-            },
-            Some(&path_filter),
-        )?;
-
-        let mut events = Vec::new();
-        let mut files_with_diffs = HashSet::new();
-
-        // Add/update files that have diffs
-        for diff in current_diffs {
-            let file_path = GitService::diff_path(&diff);
-            files_with_diffs.insert(file_path.clone());
-
-            let patch = ConversationPatch::add_diff(escape_json_pointer_segment(&file_path), diff);
-            let event = LogMsg::JsonPatch(patch).to_sse_event();
-            events.push(event);
-        }
-
-        // Remove files that changed but no longer have diffs
-        for changed_path in changed_paths {
-            if !files_with_diffs.contains(changed_path) {
-                let patch =
-                    ConversationPatch::remove_diff(escape_json_pointer_segment(changed_path));
-                let event = LogMsg::JsonPatch(patch).to_sse_event();
-                events.push(event);
-            }
-        }
-
-        Ok(events)
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatusExt::from_raw(0)
     }
 }
 
@@ -693,6 +656,10 @@ impl ContainerService for LocalContainerService {
         &self.git
     }
 
+    async fn git_branch_prefix(&self) -> String {
+        self.config.read().await.git_branch_prefix.clone()
+    }
+
     fn task_attempt_to_current_dir(&self, task_attempt: &TaskAttempt) -> PathBuf {
         PathBuf::from(task_attempt.container_ref.clone().unwrap_or_default())
     }
@@ -703,9 +670,9 @@ impl ContainerService for LocalContainerService {
             .await?
             .ok_or(sqlx::Error::RowNotFound)?;
 
-        let task_branch_name =
+        let worktree_dir_name =
             LocalContainerService::dir_name_from_task_attempt(&task_attempt.id, &task.title);
-        let worktree_path = WorktreeManager::get_worktree_base_dir().join(&task_branch_name);
+        let worktree_path = WorktreeManager::get_worktree_base_dir().join(&worktree_dir_name);
 
         let project = task
             .parent_project(&self.db.pool)
@@ -714,9 +681,9 @@ impl ContainerService for LocalContainerService {
 
         WorktreeManager::create_worktree(
             &project.git_repo_path,
-            &task_branch_name,
+            &task_attempt.branch,
             &worktree_path,
-            &task_attempt.base_branch,
+            &task_attempt.target_branch,
             true, // create new branch
         )
         .await?;
@@ -748,8 +715,6 @@ impl ContainerService for LocalContainerService {
             &worktree_path.to_string_lossy(),
         )
         .await?;
-
-        TaskAttempt::update_branch(&self.db.pool, task_attempt.id, &task_branch_name).await?;
 
         Ok(worktree_path.to_string_lossy().to_string())
     }
@@ -803,14 +768,9 @@ impl ContainerService for LocalContainerService {
         })?;
         let worktree_path = PathBuf::from(container_ref);
 
-        let branch_name = task_attempt
-            .branch
-            .as_ref()
-            .ok_or_else(|| ContainerError::Other(anyhow!("Branch not found for task attempt")))?;
-
         WorktreeManager::ensure_worktree_exists(
             &project.git_repo_path,
-            branch_name,
+            &task_attempt.branch,
             &worktree_path,
         )
         .await?;
@@ -847,16 +807,31 @@ impl ContainerService for LocalContainerService {
             )))?;
         let current_dir = PathBuf::from(container_ref);
 
-        // Create the child and stream, add to execution tracker
-        let mut child = executor_action.spawn(&current_dir).await?;
+        let approvals_service: Arc<dyn ExecutorApprovalService> =
+            match executor_action.base_executor() {
+                Some(BaseCodingAgent::Codex) | Some(BaseCodingAgent::ClaudeCode) => {
+                    ExecutorApprovalBridge::new(
+                        self.approvals.clone(),
+                        self.db.clone(),
+                        execution_process.id,
+                    )
+                }
+                _ => Arc::new(NoopExecutorApprovalService {}),
+            };
 
-        self.track_child_msgs_in_store(execution_process.id, &mut child)
+        // Create the child and stream, add to execution tracker
+        let mut spawned = executor_action
+            .spawn(&current_dir, approvals_service)
+            .await?;
+
+        self.track_child_msgs_in_store(execution_process.id, &mut spawned.child)
             .await;
 
-        self.add_child_to_store(execution_process.id, child).await;
+        self.add_child_to_store(execution_process.id, spawned.child)
+            .await;
 
-        // Spawn exit monitor
-        let _hn = self.spawn_exit_monitor(&execution_process.id);
+        // Spawn unified exit monitor: watches OS exit and optional executor signal
+        let _hn = self.spawn_exit_monitor(&execution_process.id, spawned.exit_signal);
 
         Ok(())
     }
@@ -864,6 +839,7 @@ impl ContainerService for LocalContainerService {
     async fn stop_execution(
         &self,
         execution_process: &ExecutionProcess,
+        status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError> {
         let child = self
             .get_child_from_store(&execution_process.id)
@@ -871,13 +847,14 @@ impl ContainerService for LocalContainerService {
             .ok_or_else(|| {
                 ContainerError::Other(anyhow!("Child process not found for execution"))
             })?;
-        ExecutionProcess::update_completion(
-            &self.db.pool,
-            execution_process.id,
-            ExecutionProcessStatus::Killed,
-            None,
-        )
-        .await?;
+        let exit_code = if status == ExecutionProcessStatus::Completed {
+            Some(0)
+        } else {
+            None
+        };
+
+        ExecutionProcess::update_completion(&self.db.pool, execution_process.id, status, exit_code)
+            .await?;
 
         // Kill the child process and remove from the store
         {
@@ -915,56 +892,64 @@ impl ContainerService for LocalContainerService {
             execution_process.id
         );
 
+        // Record after-head commit OID (best-effort)
+        if let Ok(ctx) = ExecutionProcess::load_context(&self.db.pool, execution_process.id).await {
+            let worktree = self.task_attempt_to_current_dir(&ctx.task_attempt);
+            if let Ok(head) = self.git().get_head_info(&worktree) {
+                let _ = ExecutionProcess::update_after_head_commit(
+                    &self.db.pool,
+                    execution_process.id,
+                    &head.oid,
+                )
+                .await;
+            }
+        }
+
         Ok(())
     }
 
-    async fn get_diff(
+    async fn stream_diff(
         &self,
         task_attempt: &TaskAttempt,
-    ) -> Result<futures::stream::BoxStream<'static, Result<Event, std::io::Error>>, ContainerError>
+        stats_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>, ContainerError>
     {
         let project_repo_path = self.get_project_repo_path(task_attempt).await?;
         let latest_merge =
             Merge::find_latest_by_task_attempt_id(&self.db.pool, task_attempt.id).await?;
-        let task_branch = task_attempt
-            .branch
-            .clone()
-            .ok_or(ContainerError::Other(anyhow!(
-                "Task attempt {} does not have a branch",
-                task_attempt.id
-            )))?;
 
         let is_ahead = if let Ok((ahead, _)) = self.git().get_branch_status(
             &project_repo_path,
-            &task_branch,
-            &task_attempt.base_branch,
+            &task_attempt.branch,
+            &task_attempt.target_branch,
         ) {
             ahead > 0
         } else {
             false
         };
 
-        // Show merged diff when no new work is on the branch or container
         if let Some(merge) = &latest_merge
             && let Some(commit) = merge.merge_commit()
             && self.is_container_clean(task_attempt).await?
             && !is_ahead
         {
-            return self.create_merged_diff_stream(&project_repo_path, &commit);
+            let wrapper =
+                self.create_merged_diff_stream(&project_repo_path, &commit, stats_only)?;
+            return Ok(Box::pin(wrapper));
         }
 
-        // worktree is needed for non-merged diffs
         let container_ref = self.ensure_container_exists(task_attempt).await?;
         let worktree_path = PathBuf::from(container_ref);
-
-        // Handle ongoing attempts (live streaming diff)
-        self.create_live_diff_stream(
+        let base_commit = self.git().get_base_commit(
             &project_repo_path,
-            &worktree_path,
-            &task_branch,
-            &task_attempt.base_branch,
-        )
-        .await
+            &task_attempt.branch,
+            &task_attempt.target_branch,
+        )?;
+
+        let wrapper = self
+            .create_live_diff_stream(&worktree_path, &base_commit, stats_only)
+            .await?;
+        Ok(Box::pin(wrapper))
     }
 
     async fn try_commit_changes(&self, ctx: &ExecutionContext) -> Result<bool, ContainerError> {
@@ -1038,8 +1023,8 @@ impl ContainerService for LocalContainerService {
     /// Copy files from the original project directory to the worktree
     async fn copy_project_files(
         &self,
-        source_dir: &PathBuf,
-        target_dir: &PathBuf,
+        source_dir: &Path,
+        target_dir: &Path,
         copy_files: &str,
     ) -> Result<(), ContainerError> {
         let files: Vec<&str> = copy_files
@@ -1057,7 +1042,7 @@ impl ContainerService for LocalContainerService {
                 && !parent.exists()
             {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    ContainerError::Other(anyhow!("Failed to create directory {:?}: {}", parent, e))
+                    ContainerError::Other(anyhow!("Failed to create directory {parent:?}: {e}"))
                 })?;
             }
 
@@ -1065,17 +1050,13 @@ impl ContainerService for LocalContainerService {
             if source_file.exists() {
                 std::fs::copy(&source_file, &target_file).map_err(|e| {
                     ContainerError::Other(anyhow!(
-                        "Failed to copy file {:?} to {:?}: {}",
-                        source_file,
-                        target_file,
-                        e
+                        "Failed to copy file {source_file:?} to {target_file:?}: {e}"
                     ))
                 })?;
                 tracing::info!("Copied file {:?} to worktree", file_path);
             } else {
                 return Err(ContainerError::Other(anyhow!(
-                    "File {:?} does not exist in the project directory",
-                    source_file
+                    "File {source_file:?} does not exist in the project directory"
                 )));
             }
         }
@@ -1096,15 +1077,15 @@ impl LocalContainerService {
         for msg in history.iter().rev() {
             if let LogMsg::JsonPatch(patch) = msg {
                 // Try to extract a NormalizedEntry from the patch
-                if let Some(entry) = self.extract_normalized_entry_from_patch(patch)
+                if let Some((_, entry)) = extract_normalized_entry_from_patch(patch)
                     && matches!(entry.entry_type, NormalizedEntryType::AssistantMessage)
                 {
                     let content = entry.content.trim();
                     if !content.is_empty() {
-                        // Truncate to reasonable size (4KB as Oracle suggested)
                         const MAX_SUMMARY_LENGTH: usize = 4096;
                         if content.len() > MAX_SUMMARY_LENGTH {
-                            return Some(format!("{}...", &content[..MAX_SUMMARY_LENGTH]));
+                            let truncated = truncate_to_char_boundary(content, MAX_SUMMARY_LENGTH);
+                            return Some(format!("{truncated}..."));
                         }
                         return Some(content.to_string());
                     }
@@ -1112,32 +1093,6 @@ impl LocalContainerService {
             }
         }
 
-        None
-    }
-
-    /// Extract a NormalizedEntry from a JsonPatch if it contains one
-    fn extract_normalized_entry_from_patch(
-        &self,
-        patch: &json_patch::Patch,
-    ) -> Option<NormalizedEntry> {
-        // Convert the patch to JSON to examine its structure
-        if let Ok(patch_json) = serde_json::to_value(patch)
-            && let Some(operations) = patch_json.as_array()
-        {
-            for operation in operations {
-                if let Some(value) = operation.get("value") {
-                    // Try to extract a NormalizedEntry from the value
-                    if let Some(patch_type) = value.get("type").and_then(|t| t.as_str())
-                        && patch_type == "NORMALIZED_ENTRY"
-                        && let Some(content) = value.get("content")
-                        && let Ok(entry) =
-                            serde_json::from_value::<NormalizedEntry>(content.clone())
-                    {
-                        return Some(entry);
-                    }
-                }
-            }
-        }
         None
     }
 
@@ -1159,5 +1114,193 @@ impl LocalContainerService {
         }
 
         Ok(())
+    }
+
+    /// If a queued follow-up draft exists for this attempt and nothing is running,
+    /// start it immediately and clear the draft.
+    async fn try_consume_queued_followup(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<(), ContainerError> {
+        // Only consider CodingAgent/cleanup chains; skip DevServer completions
+        if matches!(
+            ctx.execution_process.run_reason,
+            ExecutionProcessRunReason::DevServer
+        ) {
+            return Ok(());
+        }
+
+        // If anything is running for this attempt, bail
+        let procs =
+            ExecutionProcess::find_by_task_attempt_id(&self.db.pool, ctx.task_attempt.id, false)
+                .await?;
+        if procs
+            .iter()
+            .any(|p| matches!(p.status, ExecutionProcessStatus::Running))
+        {
+            return Ok(());
+        }
+
+        // Load draft and ensure it's eligible
+        let Some(draft) = Draft::find_by_task_attempt_and_type(
+            &self.db.pool,
+            ctx.task_attempt.id,
+            DraftType::FollowUp,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+
+        if !draft.queued || draft.prompt.trim().is_empty() {
+            return Ok(());
+        }
+
+        // Atomically acquire sending lock; if not acquired, someone else is sending.
+        if !Draft::try_mark_sending(&self.db.pool, ctx.task_attempt.id, DraftType::FollowUp)
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        // Ensure worktree exists
+        let container_ref = self.ensure_container_exists(&ctx.task_attempt).await?;
+
+        // Get session id
+        let Some(session_id) = ExecutionProcess::find_latest_session_id_by_task_attempt(
+            &self.db.pool,
+            ctx.task_attempt.id,
+        )
+        .await?
+        else {
+            tracing::warn!(
+                "No session id found for attempt {}. Cannot start queued follow-up.",
+                ctx.task_attempt.id
+            );
+            return Ok(());
+        };
+
+        // Get last coding agent process to inherit executor profile
+        let Some(latest) = ExecutionProcess::find_latest_by_task_attempt_and_run_reason(
+            &self.db.pool,
+            ctx.task_attempt.id,
+            &ExecutionProcessRunReason::CodingAgent,
+        )
+        .await?
+        else {
+            tracing::warn!(
+                "No prior CodingAgent process for attempt {}. Cannot start queued follow-up.",
+                ctx.task_attempt.id
+            );
+            return Ok(());
+        };
+
+        use executors::actions::ExecutorActionType;
+        let initial_executor_profile_id = match &latest.executor_action()?.typ {
+            ExecutorActionType::CodingAgentInitialRequest(req) => req.executor_profile_id.clone(),
+            ExecutorActionType::CodingAgentFollowUpRequest(req) => req.executor_profile_id.clone(),
+            _ => {
+                tracing::warn!(
+                    "Latest process for attempt {} is not a coding agent; skipping queued follow-up",
+                    ctx.task_attempt.id
+                );
+                return Ok(());
+            }
+        };
+
+        let executor_profile_id = executors::profile::ExecutorProfileId {
+            executor: initial_executor_profile_id.executor,
+            variant: draft.variant.clone(),
+        };
+
+        // Prepare cleanup action
+        let cleanup_action = ctx
+            .task
+            .parent_project(&self.db.pool)
+            .await?
+            .and_then(|project| self.cleanup_action(project.cleanup_script));
+
+        // Handle images: associate, copy to worktree, canonicalize prompt
+        let mut prompt = draft.prompt.clone();
+        if let Some(image_ids) = &draft.image_ids {
+            // Associate to task
+            let _ = TaskImage::associate_many_dedup(&self.db.pool, ctx.task.id, image_ids).await;
+
+            // Copy to worktree and canonicalize
+            let worktree_path = std::path::PathBuf::from(&container_ref);
+            if let Err(e) = self
+                .image_service
+                .copy_images_by_ids_to_worktree(&worktree_path, image_ids)
+                .await
+            {
+                tracing::warn!("Failed to copy images to worktree: {}", e);
+            } else {
+                prompt = ImageService::canonicalise_image_paths(&prompt, &worktree_path);
+            }
+        }
+
+        let follow_up_request =
+            executors::actions::coding_agent_follow_up::CodingAgentFollowUpRequest {
+                prompt,
+                session_id,
+                executor_profile_id,
+            };
+
+        let follow_up_action = executors::actions::ExecutorAction::new(
+            executors::actions::ExecutorActionType::CodingAgentFollowUpRequest(follow_up_request),
+            cleanup_action,
+        );
+
+        // Start the execution
+        let _ = self
+            .start_execution(
+                &ctx.task_attempt,
+                &follow_up_action,
+                &ExecutionProcessRunReason::CodingAgent,
+            )
+            .await?;
+
+        // Clear the draft to reflect that it has been consumed
+        let _ =
+            Draft::clear_after_send(&self.db.pool, ctx.task_attempt.id, DraftType::FollowUp).await;
+
+        Ok(())
+    }
+}
+
+fn truncate_to_char_boundary(content: &str, max_len: usize) -> &str {
+    if content.len() <= max_len {
+        return content;
+    }
+
+    let cutoff = content
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(content.len()))
+        .take_while(|&idx| idx <= max_len)
+        .last()
+        .unwrap_or(0);
+
+    debug_assert!(content.is_char_boundary(cutoff));
+    &content[..cutoff]
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_truncate_to_char_boundary() {
+        use super::truncate_to_char_boundary;
+
+        let input = "a".repeat(10);
+        assert_eq!(truncate_to_char_boundary(&input, 7), "a".repeat(7));
+
+        let input = "hello world";
+        assert_eq!(truncate_to_char_boundary(input, input.len()), input);
+
+        let input = "🔥🔥🔥"; // each fire emoji is 4 bytes
+        assert_eq!(truncate_to_char_boundary(input, 5), "🔥");
+        assert_eq!(truncate_to_char_boundary(input, 3), "");
     }
 }

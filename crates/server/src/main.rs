@@ -1,12 +1,15 @@
 use anyhow::{self, Error as AnyhowError};
 use deployment::{Deployment, DeploymentError};
-use server::{routes, DeploymentImpl};
+use server::{DeploymentImpl, routes};
 use sqlx::Error as SqlxError;
 use strip_ansi_escapes::strip;
 use thiserror::Error;
-use tracing_subscriber::{prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, prelude::*};
 use utils::{
-    assets::asset_dir, browser::open_browser, port_file::write_port_file, sentry::sentry_layer,
+    assets::asset_dir,
+    browser::open_browser,
+    port_file::write_port_file,
+    sentry::{self as sentry_utils, SentrySource, sentry_layer},
 };
 
 #[derive(Debug, Error)]
@@ -23,6 +26,8 @@ pub enum VibeKanbanError {
 
 #[tokio::main]
 async fn main() -> Result<(), VibeKanbanError> {
+    sentry_utils::init_once(SentrySource::Backend);
+
     let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let filter_string = format!(
         "warn,server={level},services={level},db={level},executors={level},deployment={level},local_deployment={level},utils={level}",
@@ -42,10 +47,23 @@ async fn main() -> Result<(), VibeKanbanError> {
     let deployment = DeploymentImpl::new().await?;
     deployment.update_sentry_scope().await?;
     deployment.cleanup_orphan_executions().await?;
+    deployment.backfill_before_head_commits().await?;
     deployment.spawn_pr_monitor_service().await;
     deployment
         .track_if_analytics_allowed("session_start", serde_json::json!({}))
         .await;
+
+    // Pre-warm file search cache for most active projects
+    let deployment_for_cache = deployment.clone();
+    tokio::spawn(async move {
+        if let Err(e) = deployment_for_cache
+            .file_search_cache()
+            .warm_most_active(&deployment_for_cache.db().pool, 3)
+            .await
+        {
+            tracing::warn!("Failed to warm file search cache: {}", e);
+        }
+    });
 
     let app_router = routes::router(deployment);
 
@@ -68,19 +86,23 @@ async fn main() -> Result<(), VibeKanbanError> {
     let actual_port = listener.local_addr()?.port(); // get → 53427 (example)
 
     // Write port file for discovery if prod, warn on fail
-    if !cfg!(debug_assertions) {
-        if let Err(e) = write_port_file(actual_port).await {
-            tracing::warn!("Failed to write port file: {}", e);
-        }
+    if let Err(e) = write_port_file(actual_port).await {
+        tracing::warn!("Failed to write port file: {}", e);
     }
 
     tracing::info!("Server running on http://{host}:{actual_port}");
 
     if !cfg!(debug_assertions) {
         tracing::info!("Opening browser...");
-        if let Err(e) = open_browser(&format!("http://127.0.0.1:{actual_port}")).await {
-            tracing::warn!("Failed to open browser automatically: {}. Please open http://127.0.0.1:{} manually.", e, actual_port);
-        }
+        tokio::spawn(async move {
+            if let Err(e) = open_browser(&format!("http://127.0.0.1:{actual_port}")).await {
+                tracing::warn!(
+                    "Failed to open browser automatically: {}. Please open http://127.0.0.1:{} manually.",
+                    e,
+                    actual_port
+                );
+            }
+        });
     }
 
     axum::serve(listener, app_router).await?;

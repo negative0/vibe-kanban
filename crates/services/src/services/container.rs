@@ -1,15 +1,11 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Error as AnyhowError, anyhow};
 use async_trait::async_trait;
-use axum::response::sse::Event;
 use db::{
     DBService,
     models::{
@@ -26,26 +22,65 @@ use db::{
 use executors::{
     actions::{
         ExecutorAction, ExecutorActionType,
+        coding_agent_follow_up::CodingAgentFollowUpRequest,
         coding_agent_initial::CodingAgentInitialRequest,
         script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
     },
-    executors::{CodingAgent, ExecutorError, StandardCodingAgentExecutor},
-    logs::{NormalizedEntry, NormalizedEntryType, utils::patch::ConversationPatch},
-    profile::ProfileVariantLabel,
+    executors::{ExecutorError, StandardCodingAgentExecutor},
+    logs::{NormalizedEntry, NormalizedEntryError, NormalizedEntryType, utils::ConversationPatch},
+    profile::{ExecutorConfigs, ExecutorProfileId, to_default_variant},
 };
-use futures::{StreamExt, TryStreamExt, future};
+use futures::{StreamExt, future};
 use sqlx::Error as SqlxError;
 use thiserror::Error;
 use tokio::{sync::RwLock, task::JoinHandle};
-use utils::{log_msg::LogMsg, msg_store::MsgStore};
+use utils::{
+    log_msg::LogMsg,
+    msg_store::MsgStore,
+    text::{git_branch_id, short_uuid},
+};
 use uuid::Uuid;
 
 use crate::services::{
     git::{GitService, GitServiceError},
     image::ImageService,
-    worktree_manager::WorktreeError,
+    worktree_manager::{WorktreeError, WorktreeManager},
 };
 pub type ContainerRef = String;
+
+/// Data needed for background worktree cleanup (doesn't require DB access)
+#[derive(Debug, Clone)]
+pub struct WorktreeCleanupData {
+    pub attempt_id: Uuid,
+    pub worktree_path: PathBuf,
+    pub git_repo_path: Option<PathBuf>,
+}
+
+/// Cleanup worktrees without requiring database access
+pub async fn cleanup_worktrees_direct(data: &[WorktreeCleanupData]) -> Result<(), ContainerError> {
+    for cleanup_data in data {
+        tracing::debug!(
+            "Cleaning up worktree for attempt {}: {:?}",
+            cleanup_data.attempt_id,
+            cleanup_data.worktree_path
+        );
+
+        if let Err(e) = WorktreeManager::cleanup_worktree(
+            &cleanup_data.worktree_path,
+            cleanup_data.git_repo_path.as_deref(),
+        )
+        .await
+        {
+            tracing::error!(
+                "Failed to cleanup worktree for task attempt {}: {}",
+                cleanup_data.attempt_id,
+                e
+            );
+            // Continue with other cleanups even if one fails
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum ContainerError {
@@ -84,21 +119,66 @@ pub trait ContainerService {
         self.delete_inner(task_attempt).await
     }
 
+    /// Check if a task has any running execution processes
+    async fn has_running_processes(&self, task_id: Uuid) -> Result<bool, ContainerError> {
+        let attempts = TaskAttempt::fetch_all(&self.db().pool, Some(task_id)).await?;
+
+        for attempt in attempts {
+            if let Ok(processes) =
+                ExecutionProcess::find_by_task_attempt_id(&self.db().pool, attempt.id, false).await
+            {
+                for process in processes {
+                    if process.status == ExecutionProcessStatus::Running {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Stop execution processes for task attempts without cleanup
+    async fn stop_task_processes(
+        &self,
+        task_attempts: &[TaskAttempt],
+    ) -> Result<(), ContainerError> {
+        for attempt in task_attempts {
+            self.try_stop(attempt).await;
+        }
+        Ok(())
+    }
+
+    fn cleanup_action(&self, cleanup_script: Option<String>) -> Option<Box<ExecutorAction>> {
+        cleanup_script.map(|script| {
+            Box::new(ExecutorAction::new(
+                ExecutorActionType::ScriptRequest(ScriptRequest {
+                    script,
+                    language: ScriptRequestLanguage::Bash,
+                    context: ScriptContext::CleanupScript,
+                }),
+                None,
+            ))
+        })
+    }
+
     async fn try_stop(&self, task_attempt: &TaskAttempt) {
         // stop all execution processes for this attempt
         if let Ok(processes) =
-            ExecutionProcess::find_by_task_attempt_id(&self.db().pool, task_attempt.id).await
+            ExecutionProcess::find_by_task_attempt_id(&self.db().pool, task_attempt.id, false).await
         {
             for process in processes {
                 if process.status == ExecutionProcessStatus::Running {
-                    self.stop_execution(&process).await.unwrap_or_else(|e| {
-                        tracing::debug!(
-                            "Failed to stop execution process {} for task attempt {}: {}",
-                            process.id,
-                            task_attempt.id,
-                            e
-                        );
-                    });
+                    self.stop_execution(&process, ExecutionProcessStatus::Killed)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::debug!(
+                                "Failed to stop execution process {} for task attempt {}: {}",
+                                process.id,
+                                task_attempt.id,
+                                e
+                            );
+                        });
                 }
             }
         }
@@ -122,21 +202,24 @@ pub trait ContainerService {
     async fn stop_execution(
         &self,
         execution_process: &ExecutionProcess,
+        status: ExecutionProcessStatus,
     ) -> Result<(), ContainerError>;
 
     async fn try_commit_changes(&self, ctx: &ExecutionContext) -> Result<bool, ContainerError>;
 
     async fn copy_project_files(
         &self,
-        source_dir: &PathBuf,
-        target_dir: &PathBuf,
+        source_dir: &Path,
+        target_dir: &Path,
         copy_files: &str,
     ) -> Result<(), ContainerError>;
 
-    async fn get_diff(
+    /// Stream diff updates as LogMsg for WebSocket endpoints.
+    async fn stream_diff(
         &self,
         task_attempt: &TaskAttempt,
-    ) -> Result<futures::stream::BoxStream<'static, Result<Event, std::io::Error>>, ContainerError>;
+        stats_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>, ContainerError>;
 
     /// Fetch the MsgStore for a given execution ID, panicking if missing.
     async fn get_msg_store_by_id(&self, uuid: &Uuid) -> Option<Arc<MsgStore>> {
@@ -144,35 +227,33 @@ pub trait ContainerService {
         map.get(uuid).cloned()
     }
 
+    async fn git_branch_prefix(&self) -> String;
+
+    async fn git_branch_from_task_attempt(&self, attempt_id: &Uuid, task_title: &str) -> String {
+        let task_title_id = git_branch_id(task_title);
+        let prefix = self.git_branch_prefix().await;
+
+        if prefix.is_empty() {
+            format!("{}-{}", short_uuid(attempt_id), task_title_id)
+        } else {
+            format!("{}/{}-{}", prefix, short_uuid(attempt_id), task_title_id)
+        }
+    }
+
     async fn stream_raw_logs(
         &self,
         id: &Uuid,
-    ) -> Option<futures::stream::BoxStream<'static, Result<Event, std::io::Error>>> {
+    ) -> Option<futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>> {
         if let Some(store) = self.get_msg_store_by_id(id).await {
             // First try in-memory store
-            let counter = Arc::new(AtomicUsize::new(0));
             return Some(
                 store
                     .history_plus_stream()
                     .filter(|msg| {
-                        future::ready(matches!(msg, Ok(LogMsg::Stdout(..) | LogMsg::Stderr(..))))
-                    })
-                    .map_ok({
-                        let counter = counter.clone();
-                        move |m| {
-                            let index = counter.fetch_add(1, Ordering::SeqCst);
-                            match m {
-                                LogMsg::Stdout(content) => {
-                                    let patch = ConversationPatch::add_stdout(index, content);
-                                    LogMsg::JsonPatch(patch).to_sse_event()
-                                }
-                                LogMsg::Stderr(content) => {
-                                    let patch = ConversationPatch::add_stderr(index, content);
-                                    LogMsg::JsonPatch(patch).to_sse_event()
-                                }
-                                _ => unreachable!("Filter should only pass Stdout/Stderr"),
-                            }
-                        }
+                        future::ready(matches!(
+                            msg,
+                            Ok(LogMsg::Stdout(..) | LogMsg::Stderr(..) | LogMsg::Finished)
+                        ))
                     })
                     .boxed(),
             );
@@ -196,30 +277,14 @@ pub trait ContainerService {
                 }
             };
 
-            // Direct stream from parsed messages converted to JSON patches
+            // Direct stream from parsed messages
             let stream = futures::stream::iter(
                 messages
                     .into_iter()
                     .filter(|m| matches!(m, LogMsg::Stdout(_) | LogMsg::Stderr(_)))
-                    .enumerate()
-                    .map(|(index, m)| {
-                        let event = match m {
-                            LogMsg::Stdout(content) => {
-                                let patch = ConversationPatch::add_stdout(index, content);
-                                LogMsg::JsonPatch(patch).to_sse_event()
-                            }
-                            LogMsg::Stderr(content) => {
-                                let patch = ConversationPatch::add_stderr(index, content);
-                                LogMsg::JsonPatch(patch).to_sse_event()
-                            }
-                            _ => unreachable!("Filter should only pass Stdout/Stderr"),
-                        };
-                        Ok::<_, std::io::Error>(event)
-                    }),
+                    .chain(std::iter::once(LogMsg::Finished))
+                    .map(Ok::<_, std::io::Error>),
             )
-            .chain(futures::stream::once(async {
-                Ok::<_, std::io::Error>(LogMsg::Finished.to_sse_event())
-            }))
             .boxed();
 
             Some(stream)
@@ -229,14 +294,16 @@ pub trait ContainerService {
     async fn stream_normalized_logs(
         &self,
         id: &Uuid,
-    ) -> Option<futures::stream::BoxStream<'static, Result<Event, std::io::Error>>> {
+    ) -> Option<futures::stream::BoxStream<'static, Result<LogMsg, std::io::Error>>> {
         // First try in-memory store (existing behavior)
         if let Some(store) = self.get_msg_store_by_id(id).await {
             Some(
                 store
                     .history_plus_stream() // BoxStream<Result<LogMsg, io::Error>>
                     .filter(|msg| future::ready(matches!(msg, Ok(LogMsg::JsonPatch(..)))))
-                    .map_ok(|m| m.to_sse_event()) // LogMsg -> Event
+                    .chain(futures::stream::once(async {
+                        Ok::<_, std::io::Error>(LogMsg::Finished)
+                    }))
                     .boxed(),
             )
         } else {
@@ -260,9 +327,13 @@ pub trait ContainerService {
             };
 
             // Create temporary store and populate
+            // Include JsonPatch messages (already normalized) and Stdout/Stderr (need normalization)
             let temp_store = Arc::new(MsgStore::new());
             for msg in raw_messages {
-                if matches!(msg, LogMsg::Stdout(_) | LogMsg::Stderr(_)) {
+                if matches!(
+                    msg,
+                    LogMsg::Stdout(_) | LogMsg::Stderr(_) | LogMsg::JsonPatch(_)
+                ) {
                     temp_store.push(msg);
                 }
             }
@@ -320,38 +391,14 @@ pub trait ContainerService {
             // Spawn normalizer on populated store
             match executor_action.typ() {
                 ExecutorActionType::CodingAgentInitialRequest(request) => {
-                    if let Ok(executor) =
-                        CodingAgent::from_profile_variant_label(&request.profile_variant_label)
-                    {
-                        // Inject the initial user prompt before normalization (DB fallback path)
-                        let user_entry = create_user_message(request.prompt.clone());
-                        temp_store
-                            .push_patch(ConversationPatch::add_normalized_entry(0, user_entry));
-
-                        executor.normalize_logs(temp_store.clone(), &current_dir);
-                    } else {
-                        tracing::error!(
-                            "Failed to resolve profile '{:?}' for normalization",
-                            request.profile_variant_label
-                        );
-                    }
+                    let executor = ExecutorConfigs::get_cached()
+                        .get_coding_agent_or_default(&request.executor_profile_id);
+                    executor.normalize_logs(temp_store.clone(), &current_dir);
                 }
                 ExecutorActionType::CodingAgentFollowUpRequest(request) => {
-                    if let Ok(executor) =
-                        CodingAgent::from_profile_variant_label(&request.profile_variant_label)
-                    {
-                        // Inject the follow-up user prompt before normalization (DB fallback path)
-                        let user_entry = create_user_message(request.prompt.clone());
-                        temp_store
-                            .push_patch(ConversationPatch::add_normalized_entry(0, user_entry));
-
-                        executor.normalize_logs(temp_store.clone(), &current_dir);
-                    } else {
-                        tracing::error!(
-                            "Failed to resolve profile '{:?}' for normalization",
-                            request.profile_variant_label
-                        );
-                    }
+                    let executor = ExecutorConfigs::get_cached()
+                        .get_coding_agent_or_default(&request.executor_profile_id);
+                    executor.normalize_logs(temp_store.clone(), &current_dir);
                 }
                 _ => {
                     tracing::debug!(
@@ -365,9 +412,8 @@ pub trait ContainerService {
                 temp_store
                     .history_plus_stream()
                     .filter(|msg| future::ready(matches!(msg, Ok(LogMsg::JsonPatch(..)))))
-                    .map_ok(|m| m.to_sse_event())
                     .chain(futures::stream::once(async {
-                        Ok::<_, std::io::Error>(LogMsg::Finished.to_sse_event())
+                        Ok::<_, std::io::Error>(LogMsg::Finished)
                     }))
                     .boxed(),
             )
@@ -451,7 +497,7 @@ pub trait ContainerService {
     async fn start_attempt(
         &self,
         task_attempt: &TaskAttempt,
-        profile_variant_label: ProfileVariantLabel,
+        executor_profile_id: ExecutorProfileId,
     ) -> Result<ExecutionProcess, ContainerError> {
         // Create container
         self.create(task_attempt).await?;
@@ -482,16 +528,7 @@ pub trait ContainerService {
         );
         let prompt = ImageService::canonicalise_image_paths(&task.to_prompt(), &worktree_path);
 
-        let cleanup_action = project.cleanup_script.map(|script| {
-            Box::new(ExecutorAction::new(
-                ExecutorActionType::ScriptRequest(ScriptRequest {
-                    script,
-                    language: ScriptRequestLanguage::Bash,
-                    context: ScriptContext::CleanupScript,
-                }),
-                None,
-            ))
-        });
+        let cleanup_action = self.cleanup_action(project.cleanup_script);
 
         // Choose whether to execute the setup_script or coding agent first
         let execution_process = if let Some(setup_script) = project.setup_script {
@@ -505,7 +542,7 @@ pub trait ContainerService {
                 Some(Box::new(ExecutorAction::new(
                     ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                         prompt,
-                        profile_variant_label,
+                        executor_profile_id: executor_profile_id.clone(),
                     }),
                     cleanup_action,
                 ))),
@@ -521,7 +558,7 @@ pub trait ContainerService {
             let executor_action = ExecutorAction::new(
                 ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
                     prompt,
-                    profile_variant_label,
+                    executor_profile_id: executor_profile_id.clone(),
                 }),
                 cleanup_action,
             );
@@ -553,15 +590,28 @@ pub trait ContainerService {
             Task::update_status(&self.db().pool, task.id, TaskStatus::InProgress).await?;
         }
         // Create new execution process record
+        // Capture current HEAD as the "before" commit for this execution
+        let before_head_commit = {
+            if let Some(container_ref) = &task_attempt.container_ref {
+                let wt = std::path::Path::new(container_ref);
+                self.git().get_head_info(wt).ok().map(|h| h.oid)
+            } else {
+                None
+            }
+        };
         let create_execution_process = CreateExecutionProcess {
             task_attempt_id: task_attempt.id,
             executor_action: executor_action.clone(),
             run_reason: run_reason.clone(),
         };
 
-        let execution_process =
-            ExecutionProcess::create(&self.db().pool, &create_execution_process, Uuid::new_v4())
-                .await?;
+        let execution_process = ExecutionProcess::create(
+            &self.db().pool,
+            &create_execution_process,
+            Uuid::new_v4(),
+            before_head_commit.as_deref(),
+        )
+        .await?;
 
         if let Some(prompt) = match executor_action.typ() {
             ExecutorActionType::CodingAgentInitialRequest(coding_agent_request) => {
@@ -588,58 +638,87 @@ pub trait ContainerService {
             .await?;
         }
 
-        let _ = self
+        if let Err(start_error) = self
             .start_execution_inner(task_attempt, &execution_process, executor_action)
-            .await?;
+            .await
+        {
+            // Mark process as failed
+            if let Err(update_error) = ExecutionProcess::update_completion(
+                &self.db().pool,
+                execution_process.id,
+                ExecutionProcessStatus::Failed,
+                None,
+            )
+            .await
+            {
+                tracing::error!(
+                    "Failed to mark execution process {} as failed after start error: {}",
+                    execution_process.id,
+                    update_error
+                );
+            }
+            Task::update_status(&self.db().pool, task.id, TaskStatus::InReview).await?;
+
+            // Emit stderr error message
+            let log_message = LogMsg::Stderr(format!("Failed to start execution: {start_error}"));
+            if let Ok(json_line) = serde_json::to_string(&log_message) {
+                let _ = ExecutionProcessLogs::append_log_line(
+                    &self.db().pool,
+                    execution_process.id,
+                    &format!("{json_line}\n"),
+                )
+                .await;
+            }
+
+            // Emit NextAction with failure context for coding agent requests
+            if let ContainerError::ExecutorError(ExecutorError::ExecutableNotFound { program }) =
+                &start_error
+            {
+                let help_text = format!("The required executable `{program}` is not installed.");
+                let error_message = NormalizedEntry {
+                    timestamp: None,
+                    entry_type: NormalizedEntryType::ErrorMessage {
+                        error_type: NormalizedEntryError::SetupRequired,
+                    },
+                    content: help_text,
+                    metadata: None,
+                };
+                let patch = ConversationPatch::add_normalized_entry(2, error_message);
+                if let Ok(json_line) = serde_json::to_string::<LogMsg>(&LogMsg::JsonPatch(patch)) {
+                    let _ = ExecutionProcessLogs::append_log_line(
+                        &self.db().pool,
+                        execution_process.id,
+                        &format!("{json_line}\n"),
+                    )
+                    .await;
+                }
+            };
+            return Err(start_error);
+        }
 
         // Start processing normalised logs for executor requests and follow ups
-        match executor_action.typ() {
-            ExecutorActionType::CodingAgentInitialRequest(request) => {
-                if let Some(msg_store) = self.get_msg_store_by_id(&execution_process.id).await {
-                    if let Ok(executor) =
-                        CodingAgent::from_profile_variant_label(&request.profile_variant_label)
-                    {
-                        // Prepend the initial user prompt as a normalized entry
-                        let user_entry = create_user_message(request.prompt.clone());
-                        msg_store
-                            .push_patch(ConversationPatch::add_normalized_entry(0, user_entry));
-
-                        executor.normalize_logs(
-                            msg_store,
-                            &self.task_attempt_to_current_dir(task_attempt),
-                        );
-                    } else {
-                        tracing::error!(
-                            "Failed to resolve profile '{:?}' for normalization",
-                            request.profile_variant_label
-                        );
-                    }
+        if let Some(msg_store) = self.get_msg_store_by_id(&execution_process.id).await
+            && let Some(executor_profile_id) = match executor_action.typ() {
+                ExecutorActionType::CodingAgentInitialRequest(request) => {
+                    Some(&request.executor_profile_id)
                 }
-            }
-            ExecutorActionType::CodingAgentFollowUpRequest(request) => {
-                if let Some(msg_store) = self.get_msg_store_by_id(&execution_process.id).await {
-                    if let Ok(executor) =
-                        CodingAgent::from_profile_variant_label(&request.profile_variant_label)
-                    {
-                        // Prepend the follow-up user prompt as a normalized entry
-                        let user_entry = create_user_message(request.prompt.clone());
-                        msg_store
-                            .push_patch(ConversationPatch::add_normalized_entry(0, user_entry));
-
-                        executor.normalize_logs(
-                            msg_store,
-                            &self.task_attempt_to_current_dir(task_attempt),
-                        );
-                    } else {
-                        tracing::error!(
-                            "Failed to resolve profile '{:?}' for normalization",
-                            request.profile_variant_label
-                        );
-                    }
+                ExecutorActionType::CodingAgentFollowUpRequest(request) => {
+                    Some(&request.executor_profile_id)
                 }
+                _ => None,
             }
-            _ => {}
-        };
+        {
+            if let Some(executor) =
+                ExecutorConfigs::get_cached().get_coding_agent(executor_profile_id)
+            {
+                executor.normalize_logs(msg_store, &self.task_attempt_to_current_dir(task_attempt));
+            } else {
+                tracing::error!(
+                    "Failed to resolve profile '{:?}' for normalization",
+                    executor_profile_id
+                );
+            }
+        }
 
         self.spawn_stream_raw_logs_to_db(&execution_process.id);
         Ok(execution_process)
@@ -649,29 +728,26 @@ pub trait ContainerService {
         let action = ctx.execution_process.executor_action()?;
         let next_action = if let Some(next_action) = action.next_action() {
             next_action
-        } else if matches!(
-            ctx.execution_process.run_reason,
-            ExecutionProcessRunReason::SetupScript
-        ) {
-            return Err(ContainerError::Other(anyhow::anyhow!(
-                "No next action configured for SetupScript"
-            )));
         } else {
             tracing::debug!("No next action configured");
             return Ok(());
         };
 
         // Determine the run reason of the next action
-        let next_run_reason = match ctx.execution_process.run_reason {
-            ExecutionProcessRunReason::SetupScript => ExecutionProcessRunReason::CodingAgent,
-            ExecutionProcessRunReason::CodingAgent => ExecutionProcessRunReason::CleanupScript,
-            _ => {
-                tracing::warn!(
-                    "Unexpected run reason: {:?}, defaulting to current reason",
-                    ctx.execution_process.run_reason
-                );
-                ctx.execution_process.run_reason.clone()
+        let next_run_reason = match (action.typ(), next_action.typ()) {
+            (ExecutorActionType::ScriptRequest(_), ExecutorActionType::ScriptRequest(_)) => {
+                ExecutionProcessRunReason::SetupScript
             }
+            (
+                ExecutorActionType::CodingAgentInitialRequest(_)
+                | ExecutorActionType::CodingAgentFollowUpRequest(_),
+                ExecutorActionType::ScriptRequest(_),
+            ) => ExecutionProcessRunReason::CleanupScript,
+            (
+                _,
+                ExecutorActionType::CodingAgentFollowUpRequest(_)
+                | ExecutorActionType::CodingAgentInitialRequest(_),
+            ) => ExecutionProcessRunReason::CodingAgent,
         };
 
         self.start_execution(&ctx.task_attempt, next_action, &next_run_reason)
@@ -680,13 +756,63 @@ pub trait ContainerService {
         tracing::debug!("Started next action: {:?}", next_action);
         Ok(())
     }
-}
 
-fn create_user_message(prompt: String) -> NormalizedEntry {
-    NormalizedEntry {
-        timestamp: None,
-        entry_type: NormalizedEntryType::UserMessage,
-        content: prompt,
-        metadata: None,
+    async fn exit_plan_mode_tool(&self, ctx: ExecutionContext) -> Result<(), ContainerError> {
+        let execution_id = ctx.execution_process.id;
+
+        if let Err(err) = self
+            .stop_execution(&ctx.execution_process, ExecutionProcessStatus::Completed)
+            .await
+        {
+            tracing::error!("Failed to stop execution process {}: {}", execution_id, err);
+            return Err(err);
+        }
+
+        let action = ctx.execution_process.executor_action()?;
+        let executor_profile_id = match action.typ() {
+            ExecutorActionType::CodingAgentInitialRequest(req) => req.executor_profile_id.clone(),
+            ExecutorActionType::CodingAgentFollowUpRequest(req) => req.executor_profile_id.clone(),
+            _ => {
+                return Err(ContainerError::Other(anyhow::anyhow!(
+                    "exit plan mode tool called on non-coding agent action"
+                )));
+            }
+        };
+        let cleanup_chain = action.next_action().cloned();
+
+        let session_id =
+            ExecutorSession::find_by_execution_process_id(&self.db().pool, execution_id)
+                .await?
+                .and_then(|s| s.session_id);
+
+        if session_id.is_none() {
+            tracing::warn!(
+                "No executor session found for execution process {}",
+                execution_id
+            );
+            return Err(ContainerError::Other(anyhow::anyhow!(
+                "No executor session found"
+            )));
+        }
+
+        let default_profile = to_default_variant(&executor_profile_id);
+        let follow_up = CodingAgentFollowUpRequest {
+            prompt: String::from("The plan has been approved, please execute it."),
+            session_id: session_id.unwrap(),
+            executor_profile_id: default_profile,
+        };
+        let action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentFollowUpRequest(follow_up),
+            cleanup_chain.map(Box::new),
+        );
+
+        let _ = self
+            .start_execution(
+                &ctx.task_attempt,
+                &action,
+                &ExecutionProcessRunReason::CodingAgent,
+            )
+            .await?;
+        Ok(())
     }
 }

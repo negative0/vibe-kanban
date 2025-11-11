@@ -10,16 +10,20 @@ import {
 import {
   type Config,
   type Environment,
-  type ProfileConfig,
   type UserSystemInfo,
+  type BaseAgentCapability,
   CheckTokenResponse,
 } from 'shared/types';
+import type { ExecutorConfig } from 'shared/types';
 import { configApi, githubAuthApi } from '../lib/api';
+import { updateLanguageFromConfig } from '../i18n/config';
 
 interface UserSystemState {
   config: Config | null;
   environment: Environment | null;
-  profiles: ProfileConfig[] | null;
+  profiles: Record<string, ExecutorConfig> | null;
+  capabilities: Record<string, BaseAgentCapability[]> | null;
+  analyticsUserId: string | null;
 }
 
 interface UserSystemContextType {
@@ -34,9 +38,12 @@ interface UserSystemContextType {
 
   // System data access
   environment: Environment | null;
-  profiles: ProfileConfig[] | null;
+  profiles: Record<string, ExecutorConfig> | null;
+  capabilities: Record<string, BaseAgentCapability[]> | null;
+  analyticsUserId: string | null;
   setEnvironment: (env: Environment | null) => void;
-  setProfiles: (profiles: ProfileConfig[] | null) => void;
+  setProfiles: (profiles: Record<string, ExecutorConfig> | null) => void;
+  setCapabilities: (caps: Record<string, BaseAgentCapability[]> | null) => void;
 
   // Reload system data
   reloadSystem: () => Promise<void>;
@@ -58,7 +65,15 @@ export function UserSystemProvider({ children }: UserSystemProviderProps) {
   // Split state for performance - independent re-renders
   const [config, setConfig] = useState<Config | null>(null);
   const [environment, setEnvironment] = useState<Environment | null>(null);
-  const [profiles, setProfiles] = useState<ProfileConfig[] | null>(null);
+  const [profiles, setProfiles] = useState<Record<
+    string,
+    ExecutorConfig
+  > | null>(null);
+  const [capabilities, setCapabilities] = useState<Record<
+    string,
+    BaseAgentCapability[]
+  > | null>(null);
+  const [analyticsUserId, setAnalyticsUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [githubTokenInvalid, setGithubTokenInvalid] = useState(false);
 
@@ -68,7 +83,16 @@ export function UserSystemProvider({ children }: UserSystemProviderProps) {
         const userSystemInfo: UserSystemInfo = await configApi.getConfig();
         setConfig(userSystemInfo.config);
         setEnvironment(userSystemInfo.environment);
-        setProfiles(userSystemInfo.profiles);
+        setAnalyticsUserId(userSystemInfo.analytics_user_id);
+        setProfiles(
+          userSystemInfo.executors as Record<string, ExecutorConfig> | null
+        );
+        setCapabilities(
+          (userSystemInfo.capabilities || null) as Record<
+            string,
+            BaseAgentCapability[]
+          > | null
+        );
       } catch (err) {
         console.error('Error loading user system:', err);
       } finally {
@@ -78,6 +102,13 @@ export function UserSystemProvider({ children }: UserSystemProviderProps) {
 
     loadUserSystem();
   }, []);
+
+  // Sync language with i18n when config changes
+  useEffect(() => {
+    if (config?.language) {
+      updateLanguageFromConfig(config.language);
+    }
+  }, [config?.language]);
 
   // Check GitHub token validity after config loads
   useEffect(() => {
@@ -137,31 +168,40 @@ export function UserSystemProvider({ children }: UserSystemProviderProps) {
   );
 
   const reloadSystem = useCallback(async () => {
-    setLoading(true);
     try {
       const userSystemInfo: UserSystemInfo = await configApi.getConfig();
       setConfig(userSystemInfo.config);
       setEnvironment(userSystemInfo.environment);
-      setProfiles(userSystemInfo.profiles);
+      setAnalyticsUserId(userSystemInfo.analytics_user_id);
+      setProfiles(
+        userSystemInfo.executors as Record<string, ExecutorConfig> | null
+      );
+      setCapabilities(
+        (userSystemInfo.capabilities || null) as Record<
+          string,
+          BaseAgentCapability[]
+        > | null
+      );
     } catch (err) {
       console.error('Error reloading user system:', err);
-    } finally {
-      setLoading(false);
     }
   }, []);
 
   // Memoize context value to prevent unnecessary re-renders
   const value = useMemo<UserSystemContextType>(
     () => ({
-      system: { config, environment, profiles },
+      system: { config, environment, profiles, capabilities, analyticsUserId },
       config,
       environment,
       profiles,
+      capabilities,
+      analyticsUserId,
       updateConfig,
       saveConfig,
       updateAndSaveConfig,
       setEnvironment,
       setProfiles,
+      setCapabilities,
       reloadSystem,
       loading,
       githubTokenInvalid,
@@ -170,6 +210,8 @@ export function UserSystemProvider({ children }: UserSystemProviderProps) {
       config,
       environment,
       profiles,
+      capabilities,
+      analyticsUserId,
       updateConfig,
       saveConfig,
       updateAndSaveConfig,
@@ -193,30 +235,3 @@ export function useUserSystem() {
   }
   return context;
 }
-
-// TODO: delete
-// Backward compatibility hook - maintains existing API
-export function useConfig() {
-  const {
-    config,
-    updateConfig,
-    saveConfig,
-    updateAndSaveConfig,
-    loading,
-    githubTokenInvalid,
-    reloadSystem,
-  } = useUserSystem();
-  return {
-    config,
-    updateConfig,
-    saveConfig,
-    updateAndSaveConfig,
-    loading,
-    githubTokenInvalid,
-    reloadSystem,
-  };
-}
-
-// TODO: delete
-// Backward compatibility export - allows gradual migration
-export const ConfigProvider = UserSystemProvider;

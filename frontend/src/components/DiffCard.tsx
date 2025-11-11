@@ -1,9 +1,11 @@
-import { Diff as Diff, ThemeMode } from 'shared/types';
-import { DiffModeEnum, DiffView } from '@git-diff-view/react';
-import { generateDiffFile } from '@git-diff-view/file';
+import { Diff } from 'shared/types';
+import { DiffModeEnum, DiffView, SplitSide } from '@git-diff-view/react';
+import { generateDiffFile, type DiffFile } from '@git-diff-view/file';
 import { useMemo } from 'react';
-import { useConfig } from '@/components/config-provider';
+import { useUserSystem } from '@/components/config-provider';
 import { getHighLightLanguageFromPath } from '@/utils/extToLanguage';
+import { getActualTheme } from '@/utils/theme';
+import { stripLineEnding } from '@/utils/string';
 import { Button } from '@/components/ui/button';
 import {
   ChevronRight,
@@ -15,10 +17,19 @@ import {
   Copy,
   Key,
   ExternalLink,
+  MessageSquare,
 } from 'lucide-react';
 import '@/styles/diff-style-overrides.css';
 import { attemptsApi } from '@/lib/api';
 import type { TaskAttempt } from 'shared/types';
+import { useReview, type ReviewDraft } from '@/contexts/ReviewProvider';
+import { CommentWidgetLine } from '@/components/diff/CommentWidgetLine';
+import { ReviewCommentRenderer } from '@/components/diff/ReviewCommentRenderer';
+import {
+  useDiffViewMode,
+  useIgnoreWhitespaceDiff,
+} from '@/stores/useDiffViewStore';
+import { useProject } from '@/contexts/project-context';
 
 type Props = {
   diff: Diff;
@@ -39,14 +50,37 @@ function labelAndIcon(diff: Diff) {
   return { label: undefined as string | undefined, Icon: PencilLine };
 }
 
+function readPlainLine(
+  diffFile: DiffFile | null,
+  lineNumber: number,
+  side: SplitSide
+) {
+  if (!diffFile) return undefined;
+  try {
+    const rawLine =
+      side === SplitSide.old
+        ? diffFile.getOldPlainLine(lineNumber)
+        : diffFile.getNewPlainLine(lineNumber);
+    if (rawLine?.value === undefined) return undefined;
+    return stripLineEnding(rawLine.value);
+  } catch (error) {
+    console.error('Failed to read line content for review comment', error);
+    return undefined;
+  }
+}
+
 export default function DiffCard({
   diff,
   expanded,
   onToggle,
   selectedAttempt,
 }: Props) {
-  const { config } = useConfig();
-  const theme = config?.theme === ThemeMode.DARK ? 'dark' : 'light';
+  const { config } = useUserSystem();
+  const theme = getActualTheme(config?.theme);
+  const { comments, drafts, setDraft } = useReview();
+  const globalMode = useDiffViewMode();
+  const ignoreWhitespace = useIgnoreWhitespaceDiff();
+  const { projectId } = useProject();
 
   const oldName = diff.oldPath || undefined;
   const newName = diff.newPath || oldName || 'unknown';
@@ -55,14 +89,20 @@ export default function DiffCard({
   const newLang =
     getHighLightLanguageFromPath(newName || oldName || '') || 'plaintext';
   const { label, Icon } = labelAndIcon(diff);
+  const isOmitted = !!diff.contentOmitted;
 
   // Build a diff from raw contents so the viewer can expand beyond hunks
   const oldContentSafe = diff.oldContent || '';
   const newContentSafe = diff.newContent || '';
   const isContentEqual = oldContentSafe === newContentSafe;
 
+  const diffOptions = useMemo(
+    () => (ignoreWhitespace ? { ignoreWhitespace: true as const } : undefined),
+    [ignoreWhitespace]
+  );
+
   const diffFile = useMemo(() => {
-    if (isContentEqual) return null;
+    if (isContentEqual || isOmitted) return null;
     try {
       const oldFileName = oldName || newName || 'unknown';
       const newFileName = newName || oldName || 'unknown';
@@ -72,7 +112,8 @@ export default function DiffCard({
         newFileName,
         newContentSafe,
         oldLang,
-        newLang
+        newLang,
+        diffOptions
       );
       file.initRaw();
       return file;
@@ -82,16 +123,85 @@ export default function DiffCard({
     }
   }, [
     isContentEqual,
+    isOmitted,
     oldName,
     newName,
     oldLang,
     newLang,
     oldContentSafe,
     newContentSafe,
+    diffOptions,
   ]);
 
-  const add = diffFile?.additionLength ?? 0;
-  const del = diffFile?.deletionLength ?? 0;
+  const add = isOmitted
+    ? (diff.additions ?? 0)
+    : (diffFile?.additionLength ?? 0);
+  const del = isOmitted
+    ? (diff.deletions ?? 0)
+    : (diffFile?.deletionLength ?? 0);
+
+  // Review functionality
+  const filePath = newName || oldName || 'unknown';
+  const commentsForFile = useMemo(
+    () => comments.filter((c) => c.filePath === filePath),
+    [comments, filePath]
+  );
+
+  // Transform comments to git-diff-view extendData format
+  const extendData = useMemo(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const oldFileData: Record<string, { data: any }> = {};
+    const newFileData: Record<string, { data: any }> = {};
+
+    commentsForFile.forEach((comment) => {
+      const lineKey = String(comment.lineNumber);
+      if (comment.side === SplitSide.old) {
+        oldFileData[lineKey] = { data: comment };
+      } else {
+        newFileData[lineKey] = { data: comment };
+      }
+    });
+
+    return {
+      oldFile: oldFileData,
+      newFile: newFileData,
+    };
+  }, [commentsForFile]);
+
+  const handleAddWidgetClick = (lineNumber: number, side: SplitSide) => {
+    const widgetKey = `${filePath}-${side}-${lineNumber}`;
+    const codeLine = readPlainLine(diffFile, lineNumber, side);
+    const draft: ReviewDraft = {
+      filePath,
+      side,
+      lineNumber,
+      text: '',
+      ...(codeLine !== undefined ? { codeLine } : {}),
+    };
+    setDraft(widgetKey, draft);
+  };
+
+  const renderWidgetLine = (props: any) => {
+    const widgetKey = `${filePath}-${props.side}-${props.lineNumber}`;
+    const draft = drafts[widgetKey];
+    if (!draft) return null;
+
+    return (
+      <CommentWidgetLine
+        draft={draft}
+        widgetKey={widgetKey}
+        onSave={props.onClose}
+        onCancel={props.onClose}
+        projectId={projectId}
+      />
+    );
+  };
+
+  const renderExtendLine = (lineData: any) => {
+    return (
+      <ReviewCommentRenderer comment={lineData.data} projectId={projectId} />
+    );
+  };
 
   // Title row
   const title = (
@@ -116,6 +226,12 @@ export default function DiffCard({
       <span className="ml-2" style={{ color: 'hsl(var(--console-error))' }}>
         -{del}
       </span>
+      {commentsForFile.length > 0 && (
+        <span className="ml-3 inline-flex items-center gap-1 px-2 py-0.5 text-xs bg-primary/10 text-primary rounded">
+          <MessageSquare className="h-3 w-3" />
+          {commentsForFile.length}
+        </span>
+      )}
     </p>
   );
 
@@ -123,11 +239,16 @@ export default function DiffCard({
     if (!selectedAttempt?.id) return;
     try {
       const openPath = newName || oldName;
-      await attemptsApi.openEditor(
+      const response = await attemptsApi.openEditor(
         selectedAttempt.id,
         undefined,
         openPath || undefined
       );
+
+      // If a URL is returned, open it in a new window/tab
+      if (response.url) {
+        window.open(response.url, '_blank');
+      }
     } catch (err) {
       console.error('Failed to open file in IDE:', err);
     }
@@ -177,8 +298,15 @@ export default function DiffCard({
             diffViewWrap={false}
             diffViewTheme={theme}
             diffViewHighlight
-            diffViewMode={DiffModeEnum.Unified}
+            diffViewMode={
+              globalMode === 'split' ? DiffModeEnum.Split : DiffModeEnum.Unified
+            }
             diffViewFontSize={12}
+            diffViewAddWidget
+            onAddWidgetClick={handleAddWidgetClick}
+            renderWidgetLine={renderWidgetLine}
+            extendData={extendData}
+            renderExtendLine={renderExtendLine}
           />
         </div>
       )}
@@ -187,13 +315,15 @@ export default function DiffCard({
           className="px-4 pb-4 text-xs font-mono"
           style={{ color: 'hsl(var(--muted-foreground) / 0.9)' }}
         >
-          {isContentEqual
-            ? diff.change === 'renamed'
-              ? 'File renamed with no content changes.'
-              : diff.change === 'permissionChange'
-                ? 'File permission changed.'
-                : 'No content changes to display.'
-            : 'Failed to render diff for this file.'}
+          {isOmitted
+            ? 'Content omitted due to file size. Open in editor to view.'
+            : isContentEqual
+              ? diff.change === 'renamed'
+                ? 'File renamed with no content changes.'
+                : diff.change === 'permissionChange'
+                  ? 'File permission changed.'
+                  : 'No content changes to display.'
+              : 'Failed to render diff for this file.'}
         </div>
       )}
     </div>

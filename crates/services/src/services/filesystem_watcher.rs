@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures::{
-    SinkExt, StreamExt,
+    SinkExt,
     channel::mpsc::{Receiver, channel},
 };
 use ignore::{
@@ -17,6 +17,12 @@ use notify_debouncer_full::{
     DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache, new_debouncer,
 };
 use thiserror::Error;
+
+pub type WatcherComponents = (
+    Debouncer<RecommendedWatcher, RecommendedCache>,
+    Receiver<DebounceEventResult>,
+    PathBuf,
+);
 
 #[derive(Debug, Error)]
 pub enum FilesystemWatcherError {
@@ -40,27 +46,39 @@ fn build_gitignore_set(root: &Path) -> Result<Gitignore, FilesystemWatcherError>
     let mut builder = GitignoreBuilder::new(root);
 
     // Walk once to collect all .gitignore files under root
-    for result in WalkBuilder::new(root)
+    WalkBuilder::new(root)
         .follow_links(false)
         .hidden(false) // we *want* to see .gitignore
-        .standard_filters(false) // do not apply default ignores while walking
-        .git_ignore(false) // we'll add them manually
-        .git_exclude(false)
+        .filter_entry(|entry| {
+            // only recurse into directories and .gitignore files
+            entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                || entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name == ".gitignore")
+        })
         .build()
-    {
-        let dir_entry = result?;
-        if dir_entry
-            .file_type()
-            .map(|ft| ft.is_file())
-            .unwrap_or(false)
-            && dir_entry
-                .path()
-                .file_name()
-                .is_some_and(|name| name == ".gitignore")
-        {
-            builder.add(dir_entry.path());
-        }
-    }
+        .try_for_each(|result| {
+            // everything that is not a directory and is named .gitignore
+            match result {
+                Ok(dir_entry) => {
+                    if !dir_entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                        builder.add(dir_entry.path());
+                    }
+                    Ok(())
+                }
+                Err(err)
+                    if err.io_error().is_some_and(|io_err| {
+                        io_err.kind() == std::io::ErrorKind::PermissionDenied
+                    }) =>
+                {
+                    // Skip entries we don't have permission to read
+                    tracing::warn!("Permission denied reading path: {}", err);
+                    Ok(())
+                }
+                Err(e) => Err(FilesystemWatcherError::Ignore(e)),
+            }
+        })?;
 
     // Optionally include repo-local excludes
     let info_exclude = root.join(".git/info/exclude");
@@ -93,6 +111,10 @@ fn path_allowed(path: &Path, gi: &Gitignore, canonical_root: &Path) -> bool {
 
 fn debounced_should_forward(event: &DebouncedEvent, gi: &Gitignore, canonical_root: &Path) -> bool {
     // DebouncedEvent is a struct that wraps the underlying notify::Event
+    if event.kind.is_access() {
+        // Ignore access events
+        return false;
+    }
     // We can check its paths field to determine if the event should be forwarded
     event
         .paths
@@ -100,16 +122,7 @@ fn debounced_should_forward(event: &DebouncedEvent, gi: &Gitignore, canonical_ro
         .all(|path| path_allowed(path, gi, canonical_root))
 }
 
-pub fn async_watcher(
-    root: PathBuf,
-) -> Result<
-    (
-        Debouncer<RecommendedWatcher, RecommendedCache>,
-        Receiver<DebounceEventResult>,
-        PathBuf,
-    ),
-    FilesystemWatcherError,
-> {
+pub fn async_watcher(root: PathBuf) -> Result<WatcherComponents, FilesystemWatcherError> {
     let canonical_root = canonicalize_lossy(&root);
     let gi_set = Arc::new(build_gitignore_set(&canonical_root)?);
     let (mut tx, rx) = channel(64); // Increased capacity for error bursts
@@ -150,19 +163,4 @@ pub fn async_watcher(
     debouncer.watch(&canonical_root, RecursiveMode::Recursive)?;
 
     Ok((debouncer, rx, canonical_root))
-}
-
-async fn async_watch<P: AsRef<Path>>(path: P) -> Result<(), FilesystemWatcherError> {
-    let (_debouncer, mut rx, _canonical_path) = async_watcher(path.as_ref().to_path_buf())?;
-
-    // The debouncer is already watching the path, no need to call watch() again
-
-    while let Some(res) = rx.next().await {
-        match res {
-            Ok(event) => println!("changed: {event:?}"),
-            Err(e) => println!("watch error: {e:?}"),
-        }
-    }
-
-    Ok(())
 }

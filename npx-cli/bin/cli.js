@@ -1,40 +1,47 @@
 #!/usr/bin/env node
 
 const { execSync, spawn } = require("child_process");
+const AdmZip = require("adm-zip");
 const path = require("path");
 const fs = require("fs");
 
-// Detect true CPU arch on macOS (handles Rosetta)
-function getUnderlyingArch() {
+// Resolve effective arch for our published 64-bit binaries only.
+// Any ARM → arm64; anything else → x64. On macOS, handle Rosetta.
+function getEffectiveArch() {
   const platform = process.platform;
   const nodeArch = process.arch;
 
-  if (platform !== "darwin") {
-    return nodeArch;
-  }
+  if (platform === "darwin") {
+    // If Node itself is arm64, we’re natively on Apple silicon
+    if (nodeArch === "arm64") return "arm64";
 
-  // If Node itself is arm64, we’re natively on Apple silicon
-  if (nodeArch === "arm64") {
-    return "arm64";
-  }
-
-  // Otherwise check for Rosetta translation
-  try {
-    const translated = execSync("sysctl -in sysctl.proc_translated", {
-      encoding: "utf8",
-    }).trim();
-    if (translated === "1") {
-      return "arm64";
+    // Otherwise check for Rosetta translation
+    try {
+      const translated = execSync("sysctl -in sysctl.proc_translated", {
+        encoding: "utf8",
+      }).trim();
+      if (translated === "1") return "arm64";
+    } catch {
+      // sysctl key not present → assume true Intel
     }
-  } catch {
-    // sysctl key not present → assume true Intel
+    return "x64";
+  }
+
+  // Non-macOS: coerce to broad families we support
+  if (/arm/i.test(nodeArch)) return "arm64";
+
+  // On Windows with 32-bit Node (ia32), detect OS arch via env
+  if (platform === "win32") {
+    const pa = process.env.PROCESSOR_ARCHITECTURE || "";
+    const paw = process.env.PROCESSOR_ARCHITEW6432 || "";
+    if (/arm/i.test(pa) || /arm/i.test(paw)) return "arm64";
   }
 
   return "x64";
 }
 
 const platform = process.platform;
-const arch = getUnderlyingArch();
+const arch = getEffectiveArch();
 
 // Map to our build target names
 function getPlatformDir() {
@@ -82,11 +89,22 @@ function extractAndRun(baseName, launch) {
   }
 
   // extract
-  const unzipCmd =
-    platform === "win32"
-      ? `powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force"`
-      : `unzip -qq -o "${zipPath}" -d "${extractDir}"`;
-  execSync(unzipCmd, { stdio: "inherit" });
+  try {
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(extractDir, true);
+  } catch (err) {
+    console.error("❌ Failed to extract vibe-kanban archive:", err.message);
+    if (process.env.VIBE_KANBAN_DEBUG) {
+      console.error(err.stack);
+    }
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(binPath)) {
+    console.error(`❌ Extracted binary not found at: ${binPath}`);
+    console.error("This usually indicates a corrupt download. Please reinstall the package.");
+    process.exit(1);
+  }
 
   // perms & launch
   if (platform !== "win32") {

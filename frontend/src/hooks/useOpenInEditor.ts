@@ -1,27 +1,33 @@
 import { useCallback } from 'react';
 import { attemptsApi } from '@/lib/api';
-import { useEditorDialog } from '@/contexts/editor-dialog-context';
-import type { EditorType, TaskAttempt } from 'shared/types';
+import NiceModal from '@ebay/nice-modal-react';
+import type { EditorType } from 'shared/types';
+
+type OpenEditorOptions = {
+  editorType?: EditorType;
+  filePath?: string;
+};
 
 export function useOpenInEditor(
-  attempt: TaskAttempt | null,
+  attemptId?: string,
   onShowEditorDialog?: () => void
 ) {
-  const { showEditorDialog } = useEditorDialog();
-
   return useCallback(
-    async (editorType?: EditorType) => {
-      if (!attempt) return;
+    async (options?: OpenEditorOptions): Promise<void> => {
+      if (!attemptId) return;
+
+      const { editorType, filePath } = options ?? {};
 
       try {
-        const result = await attemptsApi.openEditor(attempt.id, editorType);
+        const response = await attemptsApi.openEditor(
+          attemptId,
+          editorType,
+          filePath
+        );
 
-        if (result === undefined && !editorType) {
-          if (onShowEditorDialog) {
-            onShowEditorDialog();
-          } else {
-            showEditorDialog(attempt);
-          }
+        // If a URL is returned, open it in a new window/tab
+        if (response.url) {
+          window.open(response.url, '_blank');
         }
       } catch (err) {
         console.error('Failed to open editor:', err);
@@ -29,11 +35,14 @@ export function useOpenInEditor(
           if (onShowEditorDialog) {
             onShowEditorDialog();
           } else {
-            showEditorDialog(attempt);
+            NiceModal.show('editor-selection', {
+              selectedAttemptId: attemptId,
+              filePath,
+            });
           }
         }
       }
     },
-    [attempt, onShowEditorDialog, showEditorDialog]
+    [attemptId, onShowEditorDialog]
   );
 }

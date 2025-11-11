@@ -1,60 +1,91 @@
 use core::str;
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use command_group::AsyncCommandGroup;
 use futures::StreamExt;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncWriteExt, process::Command};
 use ts_rs::TS;
-use utils::{
+use workspace_utils::{
     diff::{
         concatenate_diff_hunks, create_unified_diff, create_unified_diff_hunk,
         extract_unified_diff_hunks,
     },
     msg_store::MsgStore,
     path::make_path_relative,
-    shell::get_shell_command,
+    shell::resolve_executable_path,
 };
 
 use crate::{
-    command::CommandBuilder,
-    executors::{ExecutorError, StandardCodingAgentExecutor},
+    command::{CmdOverrides, CommandBuilder, apply_overrides},
+    executors::{AppendPrompt, ExecutorError, SpawnedChild, StandardCodingAgentExecutor},
     logs::{
-        ActionType, FileChange, NormalizedEntry, NormalizedEntryType, TodoItem,
+        ActionType, FileChange, NormalizedEntry, NormalizedEntryError, NormalizedEntryType,
+        TodoItem, ToolStatus,
         plain_text_processor::PlainTextLogProcessor,
         utils::{ConversationPatch, EntryIndexProvider},
     },
 };
 
-/// Executor for running Cursor CLI and normalizing its JSONL stream
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
-pub struct Cursor {
-    pub command: CommandBuilder,
-    pub append_prompt: Option<String>,
+mod mcp;
+const CURSOR_AUTH_REQUIRED_MSG: &str = "Authentication required. Please run 'cursor-agent login' first, or set CURSOR_API_KEY environment variable.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, JsonSchema)]
+pub struct CursorAgent {
+    #[serde(default)]
+    pub append_prompt: AppendPrompt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Force allow commands unless explicitly denied")]
+    pub force: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "auto, sonnet-4.5, sonnet-4.5-thinking, gpt-5, opus-4.1, grok")]
+    pub model: Option<String>,
+    #[serde(flatten)]
+    pub cmd: CmdOverrides,
+}
+
+impl CursorAgent {
+    pub fn base_command() -> &'static str {
+        "cursor-agent"
+    }
+
+    fn build_command_builder(&self) -> CommandBuilder {
+        let mut builder =
+            CommandBuilder::new(Self::base_command()).params(["-p", "--output-format=stream-json"]);
+
+        if self.force.unwrap_or(false) {
+            builder = builder.extend_params(["--force"]);
+        }
+
+        if let Some(model) = &self.model {
+            builder = builder.extend_params(["--model", model]);
+        }
+
+        apply_overrides(builder, &self.cmd)
+    }
 }
 
 #[async_trait]
-impl StandardCodingAgentExecutor for Cursor {
-    async fn spawn(
-        &self,
-        current_dir: &PathBuf,
-        prompt: &str,
-    ) -> Result<AsyncGroupChild, ExecutorError> {
-        let (shell_cmd, shell_arg) = get_shell_command();
-        let agent_cmd = self.command.build_initial();
+impl StandardCodingAgentExecutor for CursorAgent {
+    async fn spawn(&self, current_dir: &Path, prompt: &str) -> Result<SpawnedChild, ExecutorError> {
+        mcp::ensure_mcp_server_trust(self, current_dir).await;
 
-        let combined_prompt = utils::text::combine_prompt(&self.append_prompt, prompt);
+        let command_parts = self.build_command_builder().build_initial()?;
 
-        let mut command = Command::new(shell_cmd);
+        let (executable_path, args) = command_parts.into_resolved().await?;
+
+        let combined_prompt = self.append_prompt.combine_prompt(prompt);
+
+        let mut command = Command::new(executable_path);
         command
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(current_dir)
-            .arg(shell_arg)
-            .arg(&agent_cmd);
+            .args(&args);
 
         let mut child = command.group_spawn()?;
 
@@ -63,31 +94,32 @@ impl StandardCodingAgentExecutor for Cursor {
             stdin.shutdown().await?;
         }
 
-        Ok(child)
+        Ok(child.into())
     }
 
     async fn spawn_follow_up(
         &self,
-        current_dir: &PathBuf,
+        current_dir: &Path,
         prompt: &str,
         session_id: &str,
-    ) -> Result<AsyncGroupChild, ExecutorError> {
-        let (shell_cmd, shell_arg) = get_shell_command();
-        let agent_cmd = self
-            .command
-            .build_follow_up(&["--resume".to_string(), session_id.to_string()]);
+    ) -> Result<SpawnedChild, ExecutorError> {
+        mcp::ensure_mcp_server_trust(self, current_dir).await;
 
-        let combined_prompt = utils::text::combine_prompt(&self.append_prompt, prompt);
+        let command_parts = self
+            .build_command_builder()
+            .build_follow_up(&["--resume".to_string(), session_id.to_string()])?;
+        let (executable_path, args) = command_parts.into_resolved().await?;
 
-        let mut command = Command::new(shell_cmd);
+        let combined_prompt = self.append_prompt.combine_prompt(prompt);
+
+        let mut command = Command::new(executable_path);
         command
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(current_dir)
-            .arg(shell_arg)
-            .arg(&agent_cmd);
+            .args(&args);
 
         let mut child = command.group_spawn()?;
 
@@ -96,28 +128,61 @@ impl StandardCodingAgentExecutor for Cursor {
             stdin.shutdown().await?;
         }
 
-        Ok(child)
+        Ok(child.into())
     }
 
-    fn normalize_logs(&self, msg_store: Arc<MsgStore>, worktree_path: &PathBuf) {
+    fn normalize_logs(&self, msg_store: Arc<MsgStore>, worktree_path: &Path) {
         let entry_index_provider = EntryIndexProvider::start_from(&msg_store);
 
+        // Custom stderr processor for Cursor that detects login errors
+        let msg_store_stderr = msg_store.clone();
+        let entry_index_provider_stderr = entry_index_provider.clone();
+        tokio::spawn(async move {
+            let mut stderr = msg_store_stderr.stderr_chunked_stream();
+            let mut processor = PlainTextLogProcessor::builder()
+                .normalized_entry_producer(Box::new(|content: String| {
+                    let content = strip_ansi_escapes::strip_str(&content);
+
+                    NormalizedEntry {
+                        timestamp: None,
+                        entry_type: NormalizedEntryType::ErrorMessage {
+                            error_type: NormalizedEntryError::Other,
+                        },
+                        content,
+                        metadata: None,
+                    }
+                }))
+                .time_gap(Duration::from_secs(2))
+                .index_provider(entry_index_provider_stderr.clone())
+                .build();
+
+            while let Some(Ok(chunk)) = stderr.next().await {
+                let content = strip_ansi_escapes::strip_str(&chunk);
+                if content.contains(CURSOR_AUTH_REQUIRED_MSG) {
+                    let error_message = NormalizedEntry {
+                        timestamp: None,
+                        entry_type: NormalizedEntryType::ErrorMessage {
+                            error_type: NormalizedEntryError::SetupRequired,
+                        },
+                        content: content.to_string(),
+                        metadata: None,
+                    };
+                    let id = entry_index_provider_stderr.next();
+                    msg_store_stderr
+                        .push_patch(ConversationPatch::add_normalized_entry(id, error_message));
+                } else {
+                    // Always emit error message
+                    for patch in processor.process(chunk) {
+                        msg_store_stderr.push_patch(patch);
+                    }
+                }
+            }
+        });
+
         // Process Cursor stdout JSONL with typed serde models
-        let current_dir = worktree_path.clone();
+        let current_dir = worktree_path.to_path_buf();
         tokio::spawn(async move {
             let mut lines = msg_store.stdout_lines_stream();
-
-            // Cursor agent doesn't use STDERR. Everything comes through STDOUT, both JSONL and raw error output.
-            let mut error_plaintext_processor = PlainTextLogProcessor::builder()
-                .normalized_entry_producer(Box::new(|content: String| NormalizedEntry {
-                    timestamp: None,
-                    entry_type: NormalizedEntryType::ErrorMessage,
-                    content,
-                    metadata: None,
-                }))
-                .time_gap(Duration::from_secs(2)) // Break messages if they are 2 seconds apart
-                .index_provider(entry_index_provider.clone())
-                .build();
 
             // Assistant streaming coalescer state
             let mut model_reported = false;
@@ -125,6 +190,8 @@ impl StandardCodingAgentExecutor for Cursor {
 
             let mut current_assistant_message_buffer = String::new();
             let mut current_assistant_message_index: Option<usize> = None;
+            let mut current_thinking_message_buffer = String::new();
+            let mut current_thinking_message_index: Option<usize> = None;
 
             let worktree_str = current_dir.to_string_lossy().to_string();
 
@@ -137,21 +204,17 @@ impl StandardCodingAgentExecutor for Cursor {
                 let cursor_json: CursorJson = match serde_json::from_str(&line) {
                     Ok(cursor_json) => cursor_json,
                     Err(_) => {
-                        // Not valid JSON, treat as raw error output
-                        let line = strip_ansi_escapes::strip_str(line);
-                        let line = strip_cursor_ascii_art_banner(line);
-                        if line.trim().is_empty() {
-                            continue; // Skip empty lines after stripping Noise
-                        }
+                        // Handle non-JSON output as raw system message
+                        if !line.is_empty() {
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::SystemMessage,
+                                content: line.to_string(),
+                                metadata: None,
+                            };
 
-                        // Provide a useful sign-in message if needed
-                        let line = if line == "Press any key to sign in..." {
-                            "Please sign in to Cursor CLI using `cursor-agent login` or set the CURSOR_API_KEY environment variable.".to_string()
-                        } else {
-                            line
-                        };
-
-                        for patch in error_plaintext_processor.process(line + "\n") {
+                            let patch_id = entry_index_provider.next();
+                            let patch = ConversationPatch::add_normalized_entry(patch_id, entry);
                             msg_store.push_patch(patch);
                         }
                         continue;
@@ -165,10 +228,15 @@ impl StandardCodingAgentExecutor for Cursor {
                 }
 
                 let is_assistant_message = matches!(cursor_json, CursorJson::Assistant { .. });
+                let is_thinking_message = matches!(cursor_json, CursorJson::Thinking { .. });
                 if !is_assistant_message && current_assistant_message_index.is_some() {
                     // flush
                     current_assistant_message_index = None;
                     current_assistant_message_buffer.clear();
+                }
+                if !is_thinking_message && current_thinking_message_index.is_some() {
+                    current_thinking_message_index = None;
+                    current_thinking_message_buffer.clear();
                 }
 
                 match &cursor_json {
@@ -210,6 +278,27 @@ impl StandardCodingAgentExecutor for Cursor {
                             };
                         }
                     }
+                    CursorJson::Thinking { text, .. } => {
+                        if let Some(chunk) = text
+                            && !chunk.is_empty()
+                        {
+                            current_thinking_message_buffer.push_str(chunk);
+                            let entry = NormalizedEntry {
+                                timestamp: None,
+                                entry_type: NormalizedEntryType::Thinking,
+                                content: current_thinking_message_buffer.clone(),
+                                metadata: None,
+                            };
+                            if let Some(id) = current_thinking_message_index {
+                                msg_store.push_patch(ConversationPatch::replace(id, entry));
+                            } else {
+                                let id = entry_index_provider.next();
+                                current_thinking_message_index = Some(id);
+                                msg_store
+                                    .push_patch(ConversationPatch::add_normalized_entry(id, entry));
+                            }
+                        }
+                    }
 
                     CursorJson::ToolCall {
                         subtype,
@@ -232,6 +321,7 @@ impl StandardCodingAgentExecutor for Cursor {
                                 entry_type: NormalizedEntryType::ToolUse {
                                     tool_name,
                                     action_type,
+                                    status: ToolStatus::Created,
                                 },
                                 content,
                                 metadata: None,
@@ -335,6 +425,7 @@ impl StandardCodingAgentExecutor for Cursor {
                                     }),
                                 };
                             }
+
                             let entry = NormalizedEntry {
                                 timestamp: None,
                                 entry_type: NormalizedEntryType::ToolUse {
@@ -351,6 +442,7 @@ impl StandardCodingAgentExecutor for Cursor {
                                         _ => tool_call.get_name().to_string(),
                                     },
                                     action_type: new_action,
+                                    status: ToolStatus::Success,
                                 },
                                 content: content_str,
                                 metadata: None,
@@ -367,7 +459,7 @@ impl StandardCodingAgentExecutor for Cursor {
                         let entry = NormalizedEntry {
                             timestamp: None,
                             entry_type: NormalizedEntryType::SystemMessage,
-                            content: format!("Raw output: `{line}`"),
+                            content: line,
                             metadata: None,
                         };
                         let id = entry_index_provider.next();
@@ -377,39 +469,16 @@ impl StandardCodingAgentExecutor for Cursor {
             }
         });
     }
-}
 
-fn strip_cursor_ascii_art_banner(line: String) -> String {
-    static BANNER_LINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let banner_lines = BANNER_LINES.get_or_init(|| {
-        r#"            +i":;;
-        [?+<l,",::;;;I
-      {[]_~iI"":::;;;;II
-  )){↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗↗ll          …  Cursor Agent
-  11{[#M##M##M#########*ppll
-  11}[]-+############oppqqIl
-  1}[]_+<il;,####bpqqqqwIIII
-  []?_~<illi_++qqwwwwww;IIII
-  ]?-+~>i~{??--wwwwwww;;;III
-  -_+]>{{{}}[[[mmmmmm_<_:;;I
-  r\\|||(()))))mmmm)1)111{?_
-   t/\\\\\|||(|ZZZ||\\\/tf^
-        ttttt/tZZfff^>
-            ^^^O>>
-              >>"#
-        .lines()
-        .map(str::to_string)
-        .collect()
-    });
-
-    for banner_line in banner_lines {
-        if line.starts_with(banner_line) {
-            return line.replacen(banner_line, "", 1).trim().to_string();
-        }
+    // MCP configuration methods
+    fn default_mcp_config_path(&self) -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|home| home.join(".cursor").join("mcp.json"))
     }
-    line
-}
 
+    async fn check_availability(&self) -> bool {
+        resolve_executable_path("cursor-agent").await.is_some()
+    }
+}
 /* ===========================
 Typed Cursor JSON structures
 =========================== */
@@ -444,6 +513,15 @@ pub enum CursorJson {
         #[serde(default)]
         session_id: Option<String>,
     },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        subtype: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     #[serde(rename = "tool_call")]
     ToolCall {
         #[serde(default)]
@@ -475,6 +553,7 @@ impl CursorJson {
             CursorJson::System { session_id, .. } => session_id.clone(),
             CursorJson::User { session_id, .. } => session_id.clone(),
             CursorJson::Assistant { session_id, .. } => session_id.clone(),
+            CursorJson::Thinking { session_id, .. } => session_id.clone(),
             CursorJson::ToolCall { session_id, .. } => session_id.clone(),
             CursorJson::Result { .. } => None,
             CursorJson::Unknown => None,
@@ -535,6 +614,12 @@ pub enum CursorToolCall {
         #[serde(default)]
         result: Option<serde_json::Value>,
     },
+    #[serde(rename = "semSearchToolCall")]
+    SemSearch {
+        args: CursorSemSearchArgs,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+    },
     #[serde(rename = "writeToolCall")]
     Write {
         args: CursorWriteArgs,
@@ -551,7 +636,7 @@ pub enum CursorToolCall {
     Edit {
         args: CursorEditArgs,
         #[serde(default)]
-        result: Option<serde_json::Value>,
+        result: Option<CursorEditResult>,
     },
     #[serde(rename = "deleteToolCall")]
     Delete {
@@ -586,6 +671,7 @@ impl CursorToolCall {
             CursorToolCall::LS { .. } => "ls",
             CursorToolCall::Glob { .. } => "glob",
             CursorToolCall::Grep { .. } => "grep",
+            CursorToolCall::SemSearch { .. } => "semsearch",
             CursorToolCall::Write { .. } => "write",
             CursorToolCall::Read { .. } => "read",
             CursorToolCall::Edit { .. } => "edit",
@@ -617,7 +703,7 @@ impl CursorToolCall {
                     format!("`{path}`"),
                 )
             }
-            CursorToolCall::Edit { args, .. } => {
+            CursorToolCall::Edit { args, result, .. } => {
                 let path = make_path_relative(&args.path, worktree_path);
                 let mut changes = vec![];
 
@@ -652,6 +738,19 @@ impl CursorToolCall {
                     });
                 }
 
+                if changes.is_empty()
+                    && let Some(CursorEditResult::Success(CursorEditSuccessResult {
+                        diff_string: Some(diff_string),
+                        ..
+                    })) = &result
+                {
+                    let hunks = extract_unified_diff_hunks(diff_string);
+                    changes.push(FileChange::Edit {
+                        unified_diff: concatenate_diff_hunks(&path, &hunks),
+                        has_line_numbers: false,
+                    });
+                }
+
                 (
                     ActionType::FileEdit {
                         path: path.clone(),
@@ -665,7 +764,7 @@ impl CursorToolCall {
                 (
                     ActionType::FileEdit {
                         path: path.clone(),
-                        changes: vec![],
+                        changes: vec![FileChange::Delete],
                     },
                     format!("`{path}`"),
                 )
@@ -687,6 +786,15 @@ impl CursorToolCall {
                         query: pattern.clone(),
                     },
                     format!("`{pattern}`"),
+                )
+            }
+            CursorToolCall::SemSearch { args, .. } => {
+                let query = &args.query;
+                (
+                    ActionType::Search {
+                        query: query.clone(),
+                    },
+                    format!("`{query}`"),
                 )
             }
             CursorToolCall::Glob { args, .. } => {
@@ -898,7 +1006,7 @@ pub struct CursorLsArgs {
 pub struct CursorGlobArgs {
     #[serde(default, alias = "globPattern", alias = "glob_pattern")]
     pub glob_pattern: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "targetDirectory")]
     pub path: Option<String>,
     #[serde(default, alias = "target_directory")]
     pub target_directory: Option<String>,
@@ -921,6 +1029,15 @@ pub struct CursorGrepArgs {
     pub head_limit: Option<u64>,
     #[serde(default)]
     pub r#type: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct CursorSemSearchArgs {
+    pub query: String,
+    #[serde(default, alias = "targetDirectories")]
+    pub target_directories: Option<Vec<String>>,
+    #[serde(default)]
+    pub explanation: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -954,6 +1071,32 @@ pub struct CursorEditArgs {
     pub str_replace: Option<CursorStrReplace>,
     #[serde(default, rename = "multiStrReplace")]
     pub multi_str_replace: Option<CursorMultiStrReplace>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorEditResult {
+    Success(CursorEditSuccessResult),
+    #[serde(untagged)]
+    Unknown {
+        #[serde(flatten)]
+        data: HashMap<String, serde_json::Value>,
+    },
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct CursorEditSuccessResult {
+    pub path: String,
+    #[serde(default, rename = "resultForModel")]
+    pub result_for_model: Option<String>,
+    #[serde(default, rename = "linesAdded")]
+    pub lines_added: Option<u64>,
+    #[serde(default, rename = "linesRemoved")]
+    pub lines_removed: Option<u64>,
+    #[serde(default, rename = "diffString")]
+    pub diff_string: Option<String>,
+    #[serde(default, rename = "afterFullFileContent")]
+    pub after_full_file_content: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -1031,16 +1174,19 @@ Tests
 mod tests {
     use std::sync::Arc;
 
-    use utils::msg_store::MsgStore;
+    use workspace_utils::msg_store::MsgStore;
 
     use super::*;
 
     #[tokio::test]
     async fn test_cursor_streaming_patch_generation() {
         // Avoid relying on feature flag in tests; construct with a dummy command
-        let executor = Cursor {
-            command: CommandBuilder::new(""),
-            append_prompt: None,
+        let executor = CursorAgent {
+            // No command field needed anymore
+            append_prompt: AppendPrompt::default(),
+            force: None,
+            model: None,
+            cmd: Default::default(),
         };
         let msg_store = Arc::new(MsgStore::new());
         let current_dir = std::path::PathBuf::from("/tmp/test-worktree");
@@ -1068,7 +1214,7 @@ mod tests {
         let history = msg_store.get_history();
         let patch_count = history
             .iter()
-            .filter(|m| matches!(m, utils::log_msg::LogMsg::JsonPatch(_)))
+            .filter(|m| matches!(m, workspace_utils::log_msg::LogMsg::JsonPatch(_)))
             .count();
         assert!(
             patch_count >= 2,

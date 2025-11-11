@@ -2,9 +2,11 @@ use std::{env, sync::OnceLock};
 
 use directories::ProjectDirs;
 
+pub mod approvals;
 pub mod assets;
 pub mod browser;
 pub mod diff;
+pub mod git;
 pub mod log_msg;
 pub mod msg_store;
 pub mod path;
@@ -12,8 +14,10 @@ pub mod port_file;
 pub mod response;
 pub mod sentry;
 pub mod shell;
+pub mod stream_ext;
 pub mod stream_lines;
 pub mod text;
+pub mod tokio;
 pub mod version;
 
 /// Cache for WSL2 detection result

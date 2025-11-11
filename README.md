@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/vibe-kanban"><img alt="npm" src="https://img.shields.io/npm/v/vibe-kanban?style=flat-square" /></a>
   <a href="https://github.com/BloopAI/vibe-kanban/blob/main/.github/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/BloopAI/vibe-kanban/.github%2Fworkflows%2Fpublish.yml" /></a>
+  <a href="https://deepwiki.com/BloopAI/vibe-kanban"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
 </p>
 
 ![](frontend/public/vibe-kanban-screenshot-overview.png)
@@ -25,12 +26,13 @@ AI coding agents are increasingly writing the world's code and human engineers n
 - Quickly review work and start dev servers
 - Track the status of tasks that your coding agents are working on
 - Centralise configuration of coding agent MCP configs
+- Open projects remotely via SSH when running Vibe Kanban on a remote server
 
 You can watch a video overview [here](https://youtu.be/TFT3KnZOOAk).
 
 ## Installation
 
-Make sure you have authenticated with your favourite coding agent. A full list of supported coding agents can be found in the [docs](https://vibekanban.com/). Then in your terminal run:
+Make sure you have authenticated with your favourite coding agent. A full list of supported coding agents can be found in the [docs](https://vibekanban.com/docs). Then in your terminal run:
 
 ```bash
 npx vibe-kanban
@@ -38,15 +40,15 @@ npx vibe-kanban
 
 ## Documentation
 
-Please head to the [website](https://vibekanban.com) for the latest documentation and user guides.
+Please head to the [website](https://vibekanban.com/docs) for the latest documentation and user guides.
 
 ## Support
 
-Please open an issue on this repo if you find any bugs or have any feature requests.
+We use [GitHub Discussions](https://github.com/BloopAI/vibe-kanban/discussions) for feature requests. Please open a discussion to create a feature request. For bugs please open an issue on this repo.
 
 ## Contributing
 
-We would prefer that ideas and changes are raised with the core team via GitHub issues, where we can discuss implementation details and alignment with the existing roadmap. Please do not open PRs without first discussing your proposal with the team.
+We would prefer that ideas and changes are first raised with the core team via [GitHub Discussions](https://github.com/BloopAI/vibe-kanban/discussions) or Discord, where we can discuss implementation details and alignment with the existing roadmap. Please do not open PRs without first discussing your proposal with the team.
 
 ## Development
 
@@ -73,7 +75,16 @@ pnpm i
 pnpm run dev
 ```
 
-This will start the frontend and backend with live reloading. A blank DB will be copied from the `dev_assets_seed` folder.
+This will start the backend. A blank DB will be copied from the `dev_assets_seed` folder.
+
+### Building the frontend
+
+To build just the frontend:
+
+```bash
+cd frontend
+pnpm build
+```
 
 ### Build from source
 
@@ -109,3 +120,20 @@ By default, Vibe Kanban uses Bloop AI's GitHub OAuth app for authentication. To 
    ```bash
    GITHUB_CLIENT_ID=your_client_id_here pnpm run build
    ```
+
+### Remote Deployment
+
+When running Vibe Kanban on a remote server (e.g., via systemctl, Docker, or cloud hosting), you can configure your editor to open projects via SSH:
+
+1. **Access via tunnel**: Use Cloudflare Tunnel, ngrok, or similar to expose the web UI
+2. **Configure remote SSH** in Settings → Editor Integration:
+   - Set **Remote SSH Host** to your server hostname or IP
+   - Set **Remote SSH User** to your SSH username (optional)
+3. **Prerequisites**:
+   - SSH access from your local machine to the remote server
+   - SSH keys configured (passwordless authentication)
+   - VSCode Remote-SSH extension
+
+When configured, the "Open in VSCode" buttons will generate URLs like `vscode://vscode-remote/ssh-remote+user@host/path` that open your local editor and connect to the remote server.
+
+See the [documentation](https://vibekanban.com/docs/configuration-customisation/global-settings#remote-ssh-configuration) for detailed setup instructions.

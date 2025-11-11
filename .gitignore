@@ -1,7 +1,6 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
 
 # Node.js
 node_modules/
@@ -66,6 +65,8 @@ coverage/
 .env
 frontend/dist
 crates/executors/bindings
+crates/utils/bindings
+crates/services/bindings
 
 build-npm-package-codesign.sh
 

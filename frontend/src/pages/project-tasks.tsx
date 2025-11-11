@@ -1,244 +1,583 @@
-import { useCallback, useEffect, useState, useMemo } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Plus } from 'lucide-react';
+import { AlertTriangle, Plus } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
-import { projectsApi, tasksApi, attemptsApi } from '@/lib/api';
-import { useTaskDialog } from '@/contexts/task-dialog-context';
-import { ProjectForm } from '@/components/projects/project-form';
-import { TaskTemplateManager } from '@/components/TaskTemplateManager';
-import { useKeyboardShortcuts } from '@/lib/keyboard-shortcuts';
+import { tasksApi } from '@/lib/api';
+import type { GitBranch } from 'shared/types';
+import { openTaskForm } from '@/lib/openTaskForm';
+import { FeatureShowcaseModal } from '@/components/showcase/FeatureShowcaseModal';
+import { showcases } from '@/config/showcases';
+import { useShowcaseTrigger } from '@/hooks/useShowcaseTrigger';
+import { usePostHog } from 'posthog-js/react';
+
 import { useSearch } from '@/contexts/search-context';
-import { useQuery } from '@tanstack/react-query';
-
+import { useProject } from '@/contexts/project-context';
+import { useTaskAttempts } from '@/hooks/useTaskAttempts';
+import { useTaskAttempt } from '@/hooks/useTaskAttempt';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useBranchStatus, useAttemptExecution } from '@/hooks';
+import { projectsApi } from '@/lib/api';
+import { paths } from '@/lib/paths';
+import { ExecutionProcessesProvider } from '@/contexts/ExecutionProcessesContext';
+import { ClickedElementsProvider } from '@/contexts/ClickedElementsProvider';
+import { ReviewProvider } from '@/contexts/ReviewProvider';
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from '@/components/ui/dialog';
-
-import {
-  getKanbanSectionClasses,
-  getMainContainerClasses,
-} from '@/lib/responsive-config';
+  useKeyCreate,
+  useKeyExit,
+  useKeyFocusSearch,
+  useKeyNavUp,
+  useKeyNavDown,
+  useKeyNavLeft,
+  useKeyNavRight,
+  useKeyOpenDetails,
+  Scope,
+  useKeyDeleteTask,
+  useKeyCycleViewBackward,
+} from '@/keyboard';
 
 import TaskKanbanBoard from '@/components/tasks/TaskKanbanBoard';
-import { TaskDetailsPanel } from '@/components/tasks/TaskDetailsPanel';
-import type { TaskWithAttemptStatus, Project, TaskAttempt } from 'shared/types';
+import type { TaskWithAttemptStatus } from 'shared/types';
 import type { DragEndEvent } from '@/components/ui/shadcn-io/kanban';
+import { useProjectTasks } from '@/hooks/useProjectTasks';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { useHotkeysContext } from 'react-hotkeys-hook';
+import { TasksLayout, type LayoutMode } from '@/components/layout/TasksLayout';
+import { PreviewPanel } from '@/components/panels/PreviewPanel';
+import { DiffsPanel } from '@/components/panels/DiffsPanel';
+import TaskAttemptPanel from '@/components/panels/TaskAttemptPanel';
+import TaskPanel from '@/components/panels/TaskPanel';
+import TodoPanel from '@/components/tasks/TodoPanel';
+import { NewCard, NewCardHeader } from '@/components/ui/new-card';
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbList,
+  BreadcrumbLink,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from '@/components/ui/breadcrumb';
+import { AttemptHeaderActions } from '@/components/panels/AttemptHeaderActions';
+import { TaskPanelHeaderActions } from '@/components/panels/TaskPanelHeaderActions';
 
 type Task = TaskWithAttemptStatus;
 
+const TASK_STATUSES = [
+  'todo',
+  'inprogress',
+  'inreview',
+  'done',
+  'cancelled',
+] as const;
+
+function DiffsPanelContainer({
+  attempt,
+  selectedTask,
+  projectId,
+  branchStatus,
+  branches,
+  setGitError,
+}: {
+  attempt: any;
+  selectedTask: any;
+  projectId: string;
+  branchStatus: any;
+  branches: GitBranch[];
+  setGitError: (error: string | null) => void;
+}) {
+  const { isAttemptRunning } = useAttemptExecution(attempt?.id);
+
+  return (
+    <DiffsPanel
+      selectedAttempt={attempt}
+      gitOps={
+        attempt && selectedTask
+          ? {
+              task: selectedTask,
+              projectId,
+              branchStatus: branchStatus ?? null,
+              branches,
+              isAttemptRunning,
+              setError: setGitError,
+              selectedBranch: branchStatus?.target_branch_name ?? null,
+            }
+          : undefined
+      }
+    />
+  );
+}
+
 export function ProjectTasks() {
-  const { projectId, taskId, attemptId } = useParams<{
+  const { t } = useTranslation(['tasks', 'common']);
+  const { taskId, attemptId } = useParams<{
     projectId: string;
     taskId?: string;
     attemptId?: string;
   }>();
   const navigate = useNavigate();
-  const location = useLocation();
+  const { enableScope, disableScope, activeScopes } = useHotkeysContext();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const isXL = useMediaQuery('(min-width: 1280px)');
+  const isMobile = !isXL;
+  const posthog = usePostHog();
 
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [project, setProject] = useState<Project | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const { openCreate, openEdit, openDuplicate } = useTaskDialog();
-  const [isProjectSettingsOpen, setIsProjectSettingsOpen] = useState(false);
-  const { query: searchQuery } = useSearch();
+  const {
+    projectId,
+    isLoading: projectLoading,
+    error: projectError,
+  } = useProject();
 
-  // Template management state
-  const [isTemplateManagerOpen, setIsTemplateManagerOpen] = useState(false);
-
-  // Panel state
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null);
-  const [isPanelOpen, setIsPanelOpen] = useState(false);
-
-  // Fullscreen state from pathname
-  const isFullscreen = location.pathname.endsWith('/full');
-
-  // Attempts fetching (only when task is selected)
-  const { data: attempts = [] } = useQuery({
-    queryKey: ['taskAttempts', selectedTask?.id],
-    queryFn: () => attemptsApi.getAll(selectedTask!.id),
-    enabled: !!selectedTask?.id,
-  });
-
-  // Selected attempt logic
-  const selectedAttempt = useMemo(() => {
-    if (!attempts.length) return null;
-    if (attemptId) {
-      const found = attempts.find((a) => a.id === attemptId);
-      if (found) return found;
-    }
-    return attempts[0] || null; // Most recent fallback
-  }, [attempts, attemptId]);
-
-  // Navigation callback for attempt selection
-  const setSelectedAttempt = useCallback(
-    (attempt: TaskAttempt | null) => {
-      if (!selectedTask) return;
-
-      const baseUrl = `/projects/${projectId}/tasks/${selectedTask.id}`;
-      const attemptUrl = attempt ? `/attempts/${attempt.id}` : '';
-      const fullSuffix = isFullscreen ? '/full' : '';
-      const fullUrl = `${baseUrl}${attemptUrl}${fullSuffix}`;
-
-      navigate(fullUrl, { replace: true });
-    },
-    [navigate, projectId, selectedTask, isFullscreen]
-  );
-
-  // Sync selectedTask with URL params
   useEffect(() => {
-    if (taskId && tasks.length > 0) {
-      const taskFromUrl = tasks.find((t) => t.id === taskId);
-      if (taskFromUrl && taskFromUrl !== selectedTask) {
-        setSelectedTask(taskFromUrl);
-        setIsPanelOpen(true);
-      }
-    } else if (!taskId && selectedTask) {
-      // Clear selection when no taskId in URL
-      setSelectedTask(null);
-      setIsPanelOpen(false);
-    }
-  }, [taskId, tasks, selectedTask]);
+    enableScope(Scope.KANBAN);
 
-  // Define task creation handler
-  const handleCreateNewTask = useCallback(() => {
-    if (!projectId) return;
-    openCreate();
-  }, [projectId, openCreate]);
+    return () => {
+      disableScope(Scope.KANBAN);
+    };
+  }, [enableScope, disableScope]);
 
-  // Full screen
-
-  const fetchProject = useCallback(async () => {
-    try {
-      const result = await projectsApi.getById(projectId!);
-      setProject(result);
-    } catch (err) {
-      setError('Failed to load project');
+  const handleCreateTask = useCallback(() => {
+    if (projectId) {
+      openTaskForm({ projectId });
     }
   }, [projectId]);
+  const { query: searchQuery, focusInput } = useSearch();
 
-  const handleCloseTemplateManager = useCallback(() => {
-    setIsTemplateManagerOpen(false);
-  }, []);
+  const {
+    tasks,
+    tasksById,
+    isLoading,
+    error: streamError,
+  } = useProjectTasks(projectId || '');
 
-  const fetchTasks = useCallback(
-    async (skipLoading = false) => {
-      try {
-        if (!skipLoading) {
-          setLoading(true);
-        }
-        const result = await tasksApi.getAll(projectId!);
-        // Only update if data has actually changed
-        setTasks((prevTasks) => {
-          const newTasks = result;
-          if (JSON.stringify(prevTasks) === JSON.stringify(newTasks)) {
-            return prevTasks; // Return same reference to prevent re-render
-          }
+  const selectedTask = useMemo(
+    () => (taskId ? (tasksById[taskId] ?? null) : null),
+    [taskId, tasksById]
+  );
 
-          setSelectedTask((prev) => {
-            if (!prev) return prev;
+  const isPanelOpen = Boolean(taskId && selectedTask);
 
-            const updatedSelectedTask = newTasks.find(
-              (task) => task.id === prev.id
-            );
+  const { isOpen: showTaskPanelShowcase, close: closeTaskPanelShowcase } =
+    useShowcaseTrigger(showcases.taskPanel, {
+      enabled: isPanelOpen,
+    });
 
-            if (JSON.stringify(prev) === JSON.stringify(updatedSelectedTask))
-              return prev;
-            return updatedSelectedTask || prev;
+  const isLatest = attemptId === 'latest';
+  const { data: attempts = [], isLoading: isAttemptsLoading } = useTaskAttempts(
+    taskId,
+    {
+      enabled: !!taskId && isLatest,
+    }
+  );
+
+  const latestAttemptId = useMemo(() => {
+    if (!attempts?.length) return undefined;
+    return [...attempts].sort((a, b) => {
+      const diff =
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      if (diff !== 0) return diff;
+      return a.id.localeCompare(b.id);
+    })[0].id;
+  }, [attempts]);
+
+  useEffect(() => {
+    if (!projectId || !taskId) return;
+    if (!isLatest) return;
+    if (isAttemptsLoading) return;
+
+    if (!latestAttemptId) {
+      navigateWithSearch(paths.task(projectId, taskId), { replace: true });
+      return;
+    }
+
+    navigateWithSearch(paths.attempt(projectId, taskId, latestAttemptId), {
+      replace: true,
+    });
+  }, [
+    projectId,
+    taskId,
+    isLatest,
+    isAttemptsLoading,
+    latestAttemptId,
+    navigate,
+  ]);
+
+  useEffect(() => {
+    if (!projectId || !taskId || isLoading) return;
+    if (selectedTask === null) {
+      navigate(`/projects/${projectId}/tasks`, { replace: true });
+    }
+  }, [projectId, taskId, isLoading, selectedTask, navigate]);
+
+  const effectiveAttemptId = attemptId === 'latest' ? undefined : attemptId;
+  const isTaskView = !!taskId && !effectiveAttemptId;
+  const { data: attempt } = useTaskAttempt(effectiveAttemptId);
+
+  const { data: branchStatus } = useBranchStatus(attempt?.id);
+  const [branches, setBranches] = useState<GitBranch[]>([]);
+  const [gitError, setGitError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!projectId) return;
+    projectsApi
+      .getBranches(projectId)
+      .then(setBranches)
+      .catch(() => setBranches([]));
+  }, [projectId]);
+
+  const rawMode = searchParams.get('view') as LayoutMode;
+  const mode: LayoutMode =
+    rawMode === 'preview' || rawMode === 'diffs' ? rawMode : null;
+
+  // TODO: Remove this redirect after v0.1.0 (legacy URL support for bookmarked links)
+  // Migrates old `view=logs` to `view=diffs`
+  useEffect(() => {
+    const view = searchParams.get('view');
+    if (view === 'logs') {
+      const params = new URLSearchParams(searchParams);
+      params.set('view', 'diffs');
+      setSearchParams(params, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
+
+  const setMode = useCallback(
+    (newMode: LayoutMode) => {
+      const params = new URLSearchParams(searchParams);
+      if (newMode === null) {
+        params.delete('view');
+      } else {
+        params.set('view', newMode);
+      }
+      setSearchParams(params, { replace: true });
+    },
+    [searchParams, setSearchParams]
+  );
+
+  const navigateWithSearch = useCallback(
+    (pathname: string, options?: { replace?: boolean }) => {
+      const search = searchParams.toString();
+      navigate({ pathname, search: search ? `?${search}` : '' }, options);
+    },
+    [navigate, searchParams]
+  );
+
+  const handleCreateNewTask = useCallback(() => {
+    handleCreateTask();
+  }, [handleCreateTask]);
+
+  useKeyCreate(handleCreateNewTask, {
+    scope: Scope.KANBAN,
+    preventDefault: true,
+  });
+
+  useKeyFocusSearch(
+    () => {
+      focusInput();
+    },
+    {
+      scope: Scope.KANBAN,
+      preventDefault: true,
+    }
+  );
+
+  useKeyExit(
+    () => {
+      if (isPanelOpen) {
+        handleClosePanel();
+      } else {
+        navigate('/projects');
+      }
+    },
+    { scope: Scope.KANBAN }
+  );
+
+  const filteredTasks = useMemo(() => {
+    if (!searchQuery.trim()) {
+      return tasks;
+    }
+    const query = searchQuery.toLowerCase();
+    return tasks.filter(
+      (task) =>
+        task.title.toLowerCase().includes(query) ||
+        (task.description && task.description.toLowerCase().includes(query))
+    );
+  }, [tasks, searchQuery]);
+
+  const groupedFilteredTasks = useMemo(() => {
+    const groups: Record<string, Task[]> = {};
+    TASK_STATUSES.forEach((status) => {
+      groups[status] = [];
+    });
+    filteredTasks.forEach((task) => {
+      const normalizedStatus = task.status.toLowerCase();
+      if (groups[normalizedStatus]) {
+        groups[normalizedStatus].push(task);
+      } else {
+        groups['todo'].push(task);
+      }
+    });
+    return groups;
+  }, [filteredTasks]);
+
+  useKeyNavUp(
+    () => {
+      selectPreviousTask();
+    },
+    {
+      scope: Scope.KANBAN,
+      preventDefault: true,
+    }
+  );
+
+  useKeyNavDown(
+    () => {
+      selectNextTask();
+    },
+    {
+      scope: Scope.KANBAN,
+      preventDefault: true,
+    }
+  );
+
+  useKeyNavLeft(
+    () => {
+      selectPreviousColumn();
+    },
+    {
+      scope: Scope.KANBAN,
+      preventDefault: true,
+    }
+  );
+
+  useKeyNavRight(
+    () => {
+      selectNextColumn();
+    },
+    {
+      scope: Scope.KANBAN,
+      preventDefault: true,
+    }
+  );
+
+  /**
+   * Cycle the attempt area view.
+   * - When panel is closed: opens task details (if a task is selected)
+   * - When panel is open: cycles among [attempt, preview, diffs]
+   */
+  const cycleView = useCallback(
+    (direction: 'forward' | 'backward' = 'forward') => {
+      const order: LayoutMode[] = [null, 'preview', 'diffs'];
+      const idx = order.indexOf(mode);
+      const next =
+        direction === 'forward'
+          ? order[(idx + 1) % order.length]
+          : order[(idx - 1 + order.length) % order.length];
+      setMode(next);
+    },
+    [mode, setMode]
+  );
+
+  const cycleViewForward = useCallback(() => cycleView('forward'), [cycleView]);
+  const cycleViewBackward = useCallback(
+    () => cycleView('backward'),
+    [cycleView]
+  );
+
+  // meta/ctrl+enter → open details or cycle forward
+  const isFollowUpReadyActive = activeScopes.includes(Scope.FOLLOW_UP_READY);
+
+  useKeyOpenDetails(
+    () => {
+      if (isPanelOpen) {
+        // Track keyboard shortcut before cycling view
+        const order: LayoutMode[] = [null, 'preview', 'diffs'];
+        const idx = order.indexOf(mode);
+        const next = order[(idx + 1) % order.length];
+
+        if (next === 'preview') {
+          posthog?.capture('preview_navigated', {
+            trigger: 'keyboard',
+            direction: 'forward',
+            timestamp: new Date().toISOString(),
+            source: 'frontend',
           });
-
-          return newTasks;
-        });
-      } catch (err) {
-        setError('Failed to load tasks');
-      } finally {
-        if (!skipLoading) {
-          setLoading(false);
+        } else if (next === 'diffs') {
+          posthog?.capture('diffs_navigated', {
+            trigger: 'keyboard',
+            direction: 'forward',
+            timestamp: new Date().toISOString(),
+            source: 'frontend',
+          });
         }
+
+        cycleViewForward();
+      } else if (selectedTask) {
+        handleViewTaskDetails(selectedTask);
       }
     },
-    [projectId]
+    { scope: Scope.KANBAN, when: () => !isFollowUpReadyActive }
   );
 
-  const handleDeleteTask = useCallback(
-    async (taskId: string) => {
-      if (!confirm('Are you sure you want to delete this task?')) return;
+  // meta/ctrl+shift+enter → cycle backward
+  useKeyCycleViewBackward(
+    () => {
+      if (isPanelOpen) {
+        // Track keyboard shortcut before cycling view
+        const order: LayoutMode[] = [null, 'preview', 'diffs'];
+        const idx = order.indexOf(mode);
+        const next = order[(idx - 1 + order.length) % order.length];
 
-      try {
-        await tasksApi.delete(taskId);
-        await fetchTasks();
-      } catch (error) {
-        setError('Failed to delete task');
+        if (next === 'preview') {
+          posthog?.capture('preview_navigated', {
+            trigger: 'keyboard',
+            direction: 'backward',
+            timestamp: new Date().toISOString(),
+            source: 'frontend',
+          });
+        } else if (next === 'diffs') {
+          posthog?.capture('diffs_navigated', {
+            trigger: 'keyboard',
+            direction: 'backward',
+            timestamp: new Date().toISOString(),
+            source: 'frontend',
+          });
+        }
+
+        cycleViewBackward();
       }
     },
-    [fetchTasks]
+    { scope: Scope.KANBAN, preventDefault: true }
   );
 
-  const handleEditTask = useCallback(
-    (task: Task) => {
-      openEdit(task);
+  useKeyDeleteTask(
+    () => {
+      // Note: Delete is now handled by TaskActionsDropdown
+      // This keyboard shortcut could trigger the dropdown action if needed
     },
-    [openEdit]
-  );
-
-  const handleDuplicateTask = useCallback(
-    (task: Task) => {
-      openDuplicate(task);
-    },
-    [openDuplicate]
-  );
-
-  const handleViewTaskDetails = useCallback(
-    (task: Task, attemptIdToShow?: string) => {
-      // setSelectedTask(task);
-      // setIsPanelOpen(true);
-      // Update URL to include task ID and optionally attempt ID
-      const targetUrl = attemptIdToShow
-        ? `/projects/${projectId}/tasks/${task.id}/attempts/${attemptIdToShow}`
-        : `/projects/${projectId}/tasks/${task.id}`;
-      navigate(targetUrl, { replace: true });
-    },
-    [projectId, navigate]
+    {
+      scope: Scope.KANBAN,
+      preventDefault: true,
+    }
   );
 
   const handleClosePanel = useCallback(() => {
-    // setIsPanelOpen(false);
-    // setSelectedTask(null);
-    // Remove task ID from URL when closing panel
-    navigate(`/projects/${projectId}/tasks`, { replace: true });
+    if (projectId) {
+      navigate(`/projects/${projectId}/tasks`, { replace: true });
+    }
   }, [projectId, navigate]);
 
-  const handleProjectSettingsSuccess = useCallback(() => {
-    setIsProjectSettingsOpen(false);
-    fetchProject(); // Refresh project data after settings change
-  }, [fetchProject]);
+  const handleViewTaskDetails = useCallback(
+    (task: Task, attemptIdToShow?: string) => {
+      if (attemptIdToShow) {
+        navigateWithSearch(paths.attempt(projectId!, task.id, attemptIdToShow));
+      } else {
+        navigateWithSearch(
+          `${paths.task(projectId!, task.id)}/attempts/latest`
+        );
+      }
+    },
+    [projectId, navigateWithSearch]
+  );
+
+  const selectNextTask = useCallback(() => {
+    if (selectedTask) {
+      const tasksInStatus = groupedFilteredTasks[selectedTask.status] || [];
+      const currentIndex = tasksInStatus.findIndex(
+        (task) => task.id === selectedTask.id
+      );
+      if (currentIndex >= 0 && currentIndex < tasksInStatus.length - 1) {
+        handleViewTaskDetails(tasksInStatus[currentIndex + 1]);
+      }
+    } else {
+      for (const status of TASK_STATUSES) {
+        const tasks = groupedFilteredTasks[status];
+        if (tasks && tasks.length > 0) {
+          handleViewTaskDetails(tasks[0]);
+          break;
+        }
+      }
+    }
+  }, [selectedTask, groupedFilteredTasks, handleViewTaskDetails]);
+
+  const selectPreviousTask = useCallback(() => {
+    if (selectedTask) {
+      const tasksInStatus = groupedFilteredTasks[selectedTask.status] || [];
+      const currentIndex = tasksInStatus.findIndex(
+        (task) => task.id === selectedTask.id
+      );
+      if (currentIndex > 0) {
+        handleViewTaskDetails(tasksInStatus[currentIndex - 1]);
+      }
+    } else {
+      for (const status of TASK_STATUSES) {
+        const tasks = groupedFilteredTasks[status];
+        if (tasks && tasks.length > 0) {
+          handleViewTaskDetails(tasks[0]);
+          break;
+        }
+      }
+    }
+  }, [selectedTask, groupedFilteredTasks, handleViewTaskDetails]);
+
+  const selectNextColumn = useCallback(() => {
+    if (selectedTask) {
+      const currentIndex = TASK_STATUSES.findIndex(
+        (status) => status === selectedTask.status
+      );
+      for (let i = currentIndex + 1; i < TASK_STATUSES.length; i++) {
+        const tasks = groupedFilteredTasks[TASK_STATUSES[i]];
+        if (tasks && tasks.length > 0) {
+          handleViewTaskDetails(tasks[0]);
+          return;
+        }
+      }
+    } else {
+      for (const status of TASK_STATUSES) {
+        const tasks = groupedFilteredTasks[status];
+        if (tasks && tasks.length > 0) {
+          handleViewTaskDetails(tasks[0]);
+          break;
+        }
+      }
+    }
+  }, [selectedTask, groupedFilteredTasks, handleViewTaskDetails]);
+
+  const selectPreviousColumn = useCallback(() => {
+    if (selectedTask) {
+      const currentIndex = TASK_STATUSES.findIndex(
+        (status) => status === selectedTask.status
+      );
+      for (let i = currentIndex - 1; i >= 0; i--) {
+        const tasks = groupedFilteredTasks[TASK_STATUSES[i]];
+        if (tasks && tasks.length > 0) {
+          handleViewTaskDetails(tasks[0]);
+          return;
+        }
+      }
+    } else {
+      for (const status of TASK_STATUSES) {
+        const tasks = groupedFilteredTasks[status];
+        if (tasks && tasks.length > 0) {
+          handleViewTaskDetails(tasks[0]);
+          break;
+        }
+      }
+    }
+  }, [selectedTask, groupedFilteredTasks, handleViewTaskDetails]);
 
   const handleDragEnd = useCallback(
     async (event: DragEndEvent) => {
       const { active, over } = event;
-
       if (!over || !active.data.current) return;
 
-      const taskId = active.id as string;
+      const draggedTaskId = active.id as string;
       const newStatus = over.id as Task['status'];
-      const task = tasks.find((t) => t.id === taskId);
-
+      const task = tasksById[draggedTaskId];
       if (!task || task.status === newStatus) return;
 
-      // Optimistically update the UI immediately
-      const previousStatus = task.status;
-      setTasks((prev) =>
-        prev.map((t) => (t.id === taskId ? { ...t, status: newStatus } : t))
-      );
-
       try {
-        await tasksApi.update(taskId, {
+        await tasksApi.update(draggedTaskId, {
           title: task.title,
           description: task.description,
           status: newStatus,
@@ -246,163 +585,234 @@ export function ProjectTasks() {
           image_ids: null,
         });
       } catch (err) {
-        // Revert the optimistic update if the API call failed
-        setTasks((prev) =>
-          prev.map((t) =>
-            t.id === taskId ? { ...t, status: previousStatus } : t
-          )
-        );
-        setError('Failed to update task status');
+        console.error('Failed to update task status:', err);
       }
     },
-    [tasks]
+    [tasksById]
   );
 
-  // Setup keyboard shortcuts
-  useKeyboardShortcuts({
-    navigate,
-    currentPath: window.location.pathname,
-    hasOpenDialog: isTemplateManagerOpen || isProjectSettingsOpen,
-    closeDialog: () => {}, // No local dialog to close
-    onC: handleCreateNewTask,
-  });
+  const isInitialTasksLoad = isLoading && tasks.length === 0;
 
-  // Initialize data when projectId changes
-  useEffect(() => {
-    if (projectId) {
-      fetchProject();
-      fetchTasks();
-
-      // Set up polling to refresh tasks every 5 seconds
-      const interval = setInterval(() => {
-        fetchTasks(true); // Skip loading spinner for polling
-      }, 2000);
-
-      // Cleanup interval on unmount
-      return () => clearInterval(interval);
-    }
-  }, [projectId]);
-
-  // Handle direct navigation to task URLs
-  useEffect(() => {
-    if (taskId && tasks.length > 0) {
-      const task = tasks.find((t) => t.id === taskId);
-      if (task) {
-        setSelectedTask((prev) => {
-          if (JSON.stringify(prev) === JSON.stringify(task)) return prev;
-          return task;
-        });
-        setIsPanelOpen(true);
-      } else {
-        // Task not found in current array - refetch to get latest data
-        fetchTasks(true);
-      }
-    } else if (taskId && tasks.length === 0 && !loading) {
-      // If we have a taskId but no tasks loaded, fetch tasks
-      fetchTasks();
-    } else if (!taskId) {
-      // Close panel when no taskId in URL
-      setIsPanelOpen(false);
-      setSelectedTask(null);
-    }
-  }, [taskId, tasks, loading, fetchTasks]);
-
-  if (loading) {
-    return <Loader message="Loading tasks..." size={32} className="py-8" />;
-  }
-
-  if (error) {
-    return <div className="text-center py-8 text-destructive">{error}</div>;
-  }
-
-  return (
-    <div
-      className={`min-h-full ${getMainContainerClasses(isPanelOpen, isFullscreen)}`}
-    >
-      {/* Left Column - Kanban Section */}
-      <div className={getKanbanSectionClasses(isPanelOpen, isFullscreen)}>
-        {tasks.length === 0 ? (
-          <div className="max-w-7xl mx-auto mt-8">
-            <Card>
-              <CardContent className="text-center py-8">
-                <p className="text-muted-foreground">
-                  No tasks found for this project.
-                </p>
-                <Button className="mt-4" onClick={handleCreateNewTask}>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Create First Task
-                </Button>
-              </CardContent>
-            </Card>
-          </div>
-        ) : (
-          <div className="w-full h-full overflow-x-auto">
-            <TaskKanbanBoard
-              tasks={tasks}
-              searchQuery={searchQuery}
-              onDragEnd={handleDragEnd}
-              onEditTask={handleEditTask}
-              onDeleteTask={handleDeleteTask}
-              onDuplicateTask={handleDuplicateTask}
-              onViewTaskDetails={handleViewTaskDetails}
-              isPanelOpen={isPanelOpen}
-            />
-          </div>
-        )}
+  if (projectError) {
+    return (
+      <div className="p-4">
+        <Alert>
+          <AlertTitle className="flex items-center gap-2">
+            <AlertTriangle size="16" />
+            {t('common:states.error')}
+          </AlertTitle>
+          <AlertDescription>
+            {projectError.message || 'Failed to load project'}
+          </AlertDescription>
+        </Alert>
       </div>
+    );
+  }
 
-      {/* Right Column - Task Details Panel */}
-      {isPanelOpen && (
-        <TaskDetailsPanel
-          task={selectedTask}
-          projectHasDevScript={!!project?.dev_script}
+  if (projectLoading && isInitialTasksLoad) {
+    return <Loader message={t('loading')} size={32} className="py-8" />;
+  }
+
+  const truncateTitle = (title: string | undefined, maxLength = 20) => {
+    if (!title) return 'Task';
+    if (title.length <= maxLength) return title;
+
+    const truncated = title.substring(0, maxLength);
+    const lastSpace = truncated.lastIndexOf(' ');
+
+    return lastSpace > 0
+      ? `${truncated.substring(0, lastSpace)}...`
+      : `${truncated}...`;
+  };
+
+  const kanbanContent =
+    tasks.length === 0 ? (
+      <div className="max-w-7xl mx-auto mt-8">
+        <Card>
+          <CardContent className="text-center py-8">
+            <p className="text-muted-foreground">{t('empty.noTasks')}</p>
+            <Button className="mt-4" onClick={handleCreateNewTask}>
+              <Plus className="h-4 w-4 mr-2" />
+              {t('empty.createFirst')}
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    ) : filteredTasks.length === 0 ? (
+      <div className="max-w-7xl mx-auto mt-8">
+        <Card>
+          <CardContent className="text-center py-8">
+            <p className="text-muted-foreground">
+              {t('empty.noSearchResults')}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    ) : (
+      <div className="w-full h-full overflow-x-auto overflow-y-auto overscroll-x-contain touch-pan-y">
+        <TaskKanbanBoard
+          groupedTasks={groupedFilteredTasks}
+          onDragEnd={handleDragEnd}
+          onViewTaskDetails={handleViewTaskDetails}
+          selectedTask={selectedTask || undefined}
+          onCreateTask={handleCreateNewTask}
           projectId={projectId!}
-          onClose={handleClosePanel}
-          onEditTask={handleEditTask}
-          onDeleteTask={handleDeleteTask}
-          isDialogOpen={isProjectSettingsOpen}
-          isFullScreen={isFullscreen}
-          setFullScreen={
-            selectedAttempt
-              ? (fullscreen) => {
-                  const baseUrl = `/projects/${projectId}/tasks/${selectedTask!.id}/attempts/${selectedAttempt.id}`;
-                  const fullUrl = fullscreen ? `${baseUrl}/full` : baseUrl;
-                  navigate(fullUrl, { replace: true });
-                }
-              : undefined
-          }
-          selectedAttempt={selectedAttempt}
-          attempts={attempts}
-          setSelectedAttempt={setSelectedAttempt}
+        />
+      </div>
+    );
+
+  const rightHeader = selectedTask ? (
+    <NewCardHeader
+      className="shrink-0"
+      actions={
+        isTaskView ? (
+          <TaskPanelHeaderActions
+            task={selectedTask}
+            onClose={() =>
+              navigate(`/projects/${projectId}/tasks`, { replace: true })
+            }
+          />
+        ) : (
+          <AttemptHeaderActions
+            mode={mode}
+            onModeChange={setMode}
+            task={selectedTask}
+            attempt={attempt ?? null}
+            onClose={() =>
+              navigate(`/projects/${projectId}/tasks`, { replace: true })
+            }
+          />
+        )
+      }
+    >
+      <div className="mx-auto w-full">
+        <Breadcrumb>
+          <BreadcrumbList>
+            <BreadcrumbItem>
+              {isTaskView ? (
+                <BreadcrumbPage>
+                  {truncateTitle(selectedTask?.title)}
+                </BreadcrumbPage>
+              ) : (
+                <BreadcrumbLink
+                  className="cursor-pointer hover:underline"
+                  onClick={() =>
+                    navigateWithSearch(paths.task(projectId!, taskId!))
+                  }
+                >
+                  {truncateTitle(selectedTask?.title)}
+                </BreadcrumbLink>
+              )}
+            </BreadcrumbItem>
+            {!isTaskView && (
+              <>
+                <BreadcrumbSeparator />
+                <BreadcrumbItem>
+                  <BreadcrumbPage>
+                    {attempt?.branch || 'Task Attempt'}
+                  </BreadcrumbPage>
+                </BreadcrumbItem>
+              </>
+            )}
+          </BreadcrumbList>
+        </Breadcrumb>
+      </div>
+    </NewCardHeader>
+  ) : null;
+
+  const attemptContent = selectedTask ? (
+    <NewCard className="h-full min-h-0 flex flex-col bg-diagonal-lines bg-muted border-0">
+      {isTaskView ? (
+        <TaskPanel task={selectedTask} />
+      ) : (
+        <TaskAttemptPanel attempt={attempt} task={selectedTask}>
+          {({ logs, followUp }) => (
+            <>
+              {gitError && (
+                <div className="mx-4 mt-4 p-3 bg-red-50 border border-red-200 rounded">
+                  <div className="text-destructive text-sm">{gitError}</div>
+                </div>
+              )}
+              <div className="flex-1 min-h-0 flex flex-col">{logs}</div>
+
+              <div className="shrink-0 border-t">
+                <div className="mx-auto w-full max-w-[50rem]">
+                  <TodoPanel />
+                </div>
+              </div>
+
+              <div className="shrink-0 border-t">
+                <div className="mx-auto w-full max-w-[50rem]">{followUp}</div>
+              </div>
+            </>
+          )}
+        </TaskAttemptPanel>
+      )}
+    </NewCard>
+  ) : null;
+
+  const auxContent = (
+    <div className="relative h-full w-full">
+      {mode === 'preview' && attempt && selectedTask && <PreviewPanel />}
+      {mode === 'diffs' && attempt && selectedTask && (
+        <DiffsPanelContainer
+          attempt={attempt}
+          selectedTask={selectedTask}
+          projectId={projectId!}
+          branchStatus={branchStatus}
+          branches={branches}
+          setGitError={setGitError}
         />
       )}
+    </div>
+  );
 
-      {/* Dialogs - rendered at main container level to avoid stacking issues */}
+  const attemptArea = attempt ? (
+    <ClickedElementsProvider attempt={attempt}>
+      <ReviewProvider key={attempt.id}>
+        <ExecutionProcessesProvider key={attempt.id} attemptId={attempt.id}>
+          <TasksLayout
+            kanban={kanbanContent}
+            attempt={attemptContent}
+            aux={auxContent}
+            isPanelOpen={isPanelOpen}
+            mode={mode}
+            isMobile={isMobile}
+            rightHeader={rightHeader}
+          />
+        </ExecutionProcessesProvider>
+      </ReviewProvider>
+    </ClickedElementsProvider>
+  ) : (
+    <TasksLayout
+      kanban={kanbanContent}
+      attempt={attemptContent}
+      aux={auxContent}
+      isPanelOpen={isPanelOpen}
+      mode={mode}
+      isMobile={isMobile}
+      rightHeader={rightHeader}
+    />
+  );
 
-      <ProjectForm
-        open={isProjectSettingsOpen}
-        onClose={() => setIsProjectSettingsOpen(false)}
-        onSuccess={handleProjectSettingsSuccess}
-        project={project}
+  return (
+    <div className="min-h-full h-full flex flex-col">
+      {streamError && (
+        <Alert className="w-full z-30 xl:sticky xl:top-0">
+          <AlertTitle className="flex items-center gap-2">
+            <AlertTriangle size="16" />
+            {t('common:states.reconnecting')}
+          </AlertTitle>
+          <AlertDescription>{streamError}</AlertDescription>
+        </Alert>
+      )}
+
+      <div className="flex-1 min-h-0">{attemptArea}</div>
+      <FeatureShowcaseModal
+        isOpen={showTaskPanelShowcase}
+        onClose={closeTaskPanelShowcase}
+        config={showcases.taskPanel}
       />
-
-      {/* Template Manager Dialog */}
-      <Dialog
-        open={isTemplateManagerOpen}
-        onOpenChange={setIsTemplateManagerOpen}
-      >
-        <DialogContent className="sm:max-w-[800px] max-h-[80vh] overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>Manage Templates</DialogTitle>
-          </DialogHeader>
-          <div className="py-4">
-            <TaskTemplateManager projectId={projectId} />
-          </div>
-          <DialogFooter>
-            <Button onClick={handleCloseTemplateManager}>Done</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

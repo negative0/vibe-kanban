@@ -1,15 +1,15 @@
 use axum::{
+    Router,
     extract::{Query, State},
     response::Json as ResponseJson,
     routing::get,
-    Router,
 };
 use deployment::Deployment;
 use serde::Deserialize;
 use services::services::filesystem::{DirectoryEntry, DirectoryListResponse, FilesystemError};
 use utils::response::ApiResponse;
 
-use crate::{error::ApiError, DeploymentImpl};
+use crate::{DeploymentImpl, error::ApiError};
 
 #[derive(Debug, Deserialize)]
 pub struct ListDirectoryQuery {
@@ -42,11 +42,18 @@ pub async fn list_git_repos(
     State(deployment): State<DeploymentImpl>,
     Query(query): Query<ListDirectoryQuery>,
 ) -> Result<ResponseJson<ApiResponse<Vec<DirectoryEntry>>>, ApiError> {
-    match deployment
-        .filesystem()
-        .list_git_repos(query.path, Some(4))
-        .await
-    {
+    let res = if let Some(ref path) = query.path {
+        deployment
+            .filesystem()
+            .list_git_repos(Some(path.clone()), 800, 1200, Some(3))
+            .await
+    } else {
+        deployment
+            .filesystem()
+            .list_common_git_repos(800, 1200, Some(4))
+            .await
+    };
+    match res {
         Ok(response) => Ok(ResponseJson(ApiResponse::success(response))),
         Err(FilesystemError::DirectoryDoesNotExist) => {
             Ok(ResponseJson(ApiResponse::error("Directory does not exist")))

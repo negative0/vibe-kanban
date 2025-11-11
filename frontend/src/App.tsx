@@ -1,175 +1,148 @@
-import { useEffect, useState } from 'react';
-import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { Navbar } from '@/components/layout/navbar';
+import { useEffect } from 'react';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { I18nextProvider } from 'react-i18next';
+import i18n from '@/i18n';
 import { Projects } from '@/pages/projects';
 import { ProjectTasks } from '@/pages/project-tasks';
+import { FullAttemptLogsPage } from '@/pages/full-attempt-logs';
+import { NormalLayout } from '@/components/layout/NormalLayout';
+import { usePostHog } from 'posthog-js/react';
 
-import { Settings } from '@/pages/Settings';
-import { McpServers } from '@/pages/McpServers';
-import { DisclaimerDialog } from '@/components/DisclaimerDialog';
-import { OnboardingDialog } from '@/components/OnboardingDialog';
-import { PrivacyOptInDialog } from '@/components/PrivacyOptInDialog';
-import { ConfigProvider, useConfig } from '@/components/config-provider';
+import {
+  AgentSettings,
+  GeneralSettings,
+  McpSettings,
+  ProjectSettings,
+  SettingsLayout,
+} from '@/pages/settings/';
+import {
+  UserSystemProvider,
+  useUserSystem,
+} from '@/components/config-provider';
 import { ThemeProvider } from '@/components/theme-provider';
 import { SearchProvider } from '@/contexts/search-context';
-import {
-  EditorDialogProvider,
-  useEditorDialog,
-} from '@/contexts/editor-dialog-context';
-import { CreatePRDialogProvider } from '@/contexts/create-pr-dialog-context';
-import { EditorSelectionDialog } from '@/components/tasks/EditorSelectionDialog';
-import CreatePRDialog from '@/components/tasks/Toolbar/CreatePRDialog';
-import { TaskDialogProvider } from '@/contexts/task-dialog-context';
-import { TaskFormDialogContainer } from '@/components/tasks/TaskFormDialogContainer';
+
+import { HotkeysProvider } from 'react-hotkeys-hook';
+
 import { ProjectProvider } from '@/contexts/project-context';
-import type { EditorType, ProfileVariantLabel } from 'shared/types';
 import { ThemeMode } from 'shared/types';
-import { configApi } from '@/lib/api';
 import * as Sentry from '@sentry/react';
 import { Loader } from '@/components/ui/loader';
-import { GitHubLoginDialog } from '@/components/GitHubLoginDialog';
-import { ReleaseNotesDialog } from '@/components/ReleaseNotesDialog';
-import { AppWithStyleOverride } from '@/utils/style-override';
-import { WebviewContextMenu } from '@/vscode/ContextMenu';
-import { DevBanner } from '@/components/DevBanner';
+
+import NiceModal from '@ebay/nice-modal-react';
+import { OnboardingResult } from './components/dialogs/global/OnboardingDialog';
+import { ClickedElementsProvider } from './contexts/ClickedElementsProvider';
 
 const SentryRoutes = Sentry.withSentryReactRouterV6Routing(Routes);
 
 function AppContent() {
-  const { config, updateConfig, loading } = useConfig();
-  const location = useLocation();
-  const {
-    isOpen: editorDialogOpen,
-    selectedAttempt,
-    closeEditorDialog,
-  } = useEditorDialog();
-  const [showDisclaimer, setShowDisclaimer] = useState(false);
-  const [showOnboarding, setShowOnboarding] = useState(false);
-  const [showPrivacyOptIn, setShowPrivacyOptIn] = useState(false);
-  const [showGitHubLogin, setShowGitHubLogin] = useState(false);
-  const [showReleaseNotes, setShowReleaseNotes] = useState(false);
-  const showNavbar = !location.pathname.endsWith('/full');
+  const { config, analyticsUserId, updateAndSaveConfig, loading } =
+    useUserSystem();
+  const posthog = usePostHog();
+
+  // Handle opt-in/opt-out and user identification when config loads
+  useEffect(() => {
+    if (!posthog || !analyticsUserId) return;
+
+    const userOptedIn = config?.analytics_enabled !== false;
+
+    if (userOptedIn) {
+      posthog.opt_in_capturing();
+      posthog.identify(analyticsUserId);
+      console.log('[Analytics] Analytics enabled and user identified');
+    } else {
+      posthog.opt_out_capturing();
+      console.log('[Analytics] Analytics disabled by user preference');
+    }
+  }, [config?.analytics_enabled, analyticsUserId, posthog]);
 
   useEffect(() => {
-    if (config) {
-      setShowDisclaimer(!config.disclaimer_acknowledged);
-      if (config.disclaimer_acknowledged) {
-        setShowOnboarding(!config.onboarding_acknowledged);
-        if (config.onboarding_acknowledged) {
-          if (!config.github_login_acknowledged) {
-            setShowGitHubLogin(true);
-          } else if (!config.telemetry_acknowledged) {
-            setShowPrivacyOptIn(true);
-          } else if (config.show_release_notes) {
-            setShowReleaseNotes(true);
-          }
-        }
-      }
-    }
-  }, [config]);
+    let cancelled = false;
 
-  const handleDisclaimerAccept = async () => {
-    if (!config) return;
-
-    updateConfig({ disclaimer_acknowledged: true });
-
-    try {
-      await configApi.saveConfig({ ...config, disclaimer_acknowledged: true });
-      setShowDisclaimer(false);
-      setShowOnboarding(!config.onboarding_acknowledged);
-    } catch (err) {
-      console.error('Error saving config:', err);
-    }
-  };
-
-  const handleOnboardingComplete = async (onboardingConfig: {
-    profile: ProfileVariantLabel;
-    editor: { editor_type: EditorType; custom_command: string | null };
-  }) => {
-    if (!config) return;
-
-    const updatedConfig = {
-      ...config,
-      onboarding_acknowledged: true,
-      profile: onboardingConfig.profile,
-      editor: onboardingConfig.editor,
-    };
-
-    updateConfig(updatedConfig);
-
-    try {
-      await configApi.saveConfig(updatedConfig);
-      setShowOnboarding(false);
-    } catch (err) {
-      console.error('Error saving config:', err);
-    }
-  };
-
-  const handlePrivacyOptInComplete = async (telemetryEnabled: boolean) => {
-    if (!config) return;
-
-    const updatedConfig = {
-      ...config,
-      telemetry_acknowledged: true,
-      analytics_enabled: telemetryEnabled,
-    };
-
-    updateConfig(updatedConfig);
-
-    try {
-      await configApi.saveConfig(updatedConfig);
-      setShowPrivacyOptIn(false);
-      if (updatedConfig.show_release_notes) {
-        setShowReleaseNotes(true);
-      }
-    } catch (err) {
-      console.error('Error saving config:', err);
-    }
-  };
-
-  const handleGitHubLoginComplete = async () => {
-    try {
-      // Refresh the config to get the latest GitHub authentication state
-      const latestUserSystem = await configApi.getConfig();
-      updateConfig(latestUserSystem.config);
-      setShowGitHubLogin(false);
-
-      // If user skipped (no GitHub token), we need to manually set the acknowledgment
-
+    const handleOnboardingComplete = async (
+      onboardingConfig: OnboardingResult
+    ) => {
+      if (cancelled) return;
       const updatedConfig = {
-        ...latestUserSystem.config,
-        github_login_acknowledged: true,
+        ...config,
+        onboarding_acknowledged: true,
+        executor_profile: onboardingConfig.profile,
+        editor: onboardingConfig.editor,
       };
-      updateConfig(updatedConfig);
-      await configApi.saveConfig(updatedConfig);
-    } catch (err) {
-      console.error('Error refreshing config:', err);
-    } finally {
-      if (!config?.telemetry_acknowledged) {
-        setShowPrivacyOptIn(true);
-      } else if (config?.show_release_notes) {
-        setShowReleaseNotes(true);
-      }
-    }
-  };
 
-  const handleReleaseNotesClose = async () => {
-    if (!config) return;
-
-    const updatedConfig = {
-      ...config,
-      show_release_notes: false,
+      updateAndSaveConfig(updatedConfig);
     };
 
-    updateConfig(updatedConfig);
+    const handleDisclaimerAccept = async () => {
+      if (cancelled) return;
+      await updateAndSaveConfig({ disclaimer_acknowledged: true });
+    };
 
-    try {
-      await configApi.saveConfig(updatedConfig);
-      setShowReleaseNotes(false);
-    } catch (err) {
-      console.error('Error saving config:', err);
-    }
-  };
+    const handleGitHubLoginComplete = async () => {
+      if (cancelled) return;
+      await updateAndSaveConfig({ github_login_acknowledged: true });
+    };
+
+    const handleTelemetryOptIn = async (analyticsEnabled: boolean) => {
+      if (cancelled) return;
+      await updateAndSaveConfig({
+        telemetry_acknowledged: true,
+        analytics_enabled: analyticsEnabled,
+      });
+    };
+
+    const handleReleaseNotesClose = async () => {
+      if (cancelled) return;
+      await updateAndSaveConfig({ show_release_notes: false });
+    };
+
+    const checkOnboardingSteps = async () => {
+      if (!config || cancelled) return;
+
+      if (!config.disclaimer_acknowledged) {
+        await NiceModal.show('disclaimer');
+        await handleDisclaimerAccept();
+        await NiceModal.hide('disclaimer');
+      }
+
+      if (!config.onboarding_acknowledged) {
+        const onboardingResult: OnboardingResult =
+          await NiceModal.show('onboarding');
+        await handleOnboardingComplete(onboardingResult);
+        await NiceModal.hide('onboarding');
+      }
+
+      if (!config.github_login_acknowledged) {
+        await NiceModal.show('github-login');
+        await handleGitHubLoginComplete();
+        await NiceModal.hide('github-login');
+      }
+
+      if (!config.telemetry_acknowledged) {
+        const analyticsEnabled: boolean =
+          await NiceModal.show('privacy-opt-in');
+        await handleTelemetryOptIn(analyticsEnabled);
+        await NiceModal.hide('privacy-opt-in');
+      }
+
+      if (config.show_release_notes) {
+        await NiceModal.show('release-notes');
+        await handleReleaseNotesClose();
+        await NiceModal.hide('release-notes');
+      }
+    };
+
+    const runOnboarding = async () => {
+      if (!config || cancelled) return;
+      await checkOnboardingSteps();
+    };
+
+    runOnboarding();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [config]);
 
   if (loading) {
     return (
@@ -180,43 +153,18 @@ function AppContent() {
   }
 
   return (
-    <ThemeProvider initialTheme={config?.theme || ThemeMode.SYSTEM}>
-      <AppWithStyleOverride>
+    <I18nextProvider i18n={i18n}>
+      <ThemeProvider initialTheme={config?.theme || ThemeMode.SYSTEM}>
         <SearchProvider>
           <div className="h-screen flex flex-col bg-background">
-            {/* Custom context menu and VS Code-friendly interactions when embedded in iframe */}
-            <WebviewContextMenu />
-            <GitHubLoginDialog
-              open={showGitHubLogin}
-              onOpenChange={handleGitHubLoginComplete}
-            />
-            <DisclaimerDialog
-              open={showDisclaimer}
-              onAccept={handleDisclaimerAccept}
-            />
-            <OnboardingDialog
-              open={showOnboarding}
-              onComplete={handleOnboardingComplete}
-            />
-            <PrivacyOptInDialog
-              open={showPrivacyOptIn}
-              onComplete={handlePrivacyOptInComplete}
-            />
-            <ReleaseNotesDialog
-              open={showReleaseNotes}
-              onClose={handleReleaseNotesClose}
-            />
-            <EditorSelectionDialog
-              isOpen={editorDialogOpen}
-              onClose={closeEditorDialog}
-              selectedAttempt={selectedAttempt}
-            />
-            <CreatePRDialog />
-            <TaskFormDialogContainer />
-            {showNavbar && <DevBanner />}
-            {showNavbar && <Navbar />}
-            <div className="flex-1 h-full overflow-y-scroll">
-              <SentryRoutes>
+            <SentryRoutes>
+              {/* VS Code full-page logs route (outside NormalLayout for minimal UI) */}
+              <Route
+                path="/projects/:projectId/tasks/:taskId/attempts/:attemptId/full"
+                element={<FullAttemptLogsPage />}
+              />
+
+              <Route element={<NormalLayout />}>
                 <Route path="/" element={<Projects />} />
                 <Route path="/projects" element={<Projects />} />
                 <Route path="/projects/:projectId" element={<Projects />} />
@@ -224,43 +172,48 @@ function AppContent() {
                   path="/projects/:projectId/tasks"
                   element={<ProjectTasks />}
                 />
+                <Route path="/settings/*" element={<SettingsLayout />}>
+                  <Route index element={<Navigate to="general" replace />} />
+                  <Route path="general" element={<GeneralSettings />} />
+                  <Route path="projects" element={<ProjectSettings />} />
+                  <Route path="agents" element={<AgentSettings />} />
+                  <Route path="mcp" element={<McpSettings />} />
+                </Route>
                 <Route
-                  path="/projects/:projectId/tasks/:taskId/attempts/:attemptId"
-                  element={<ProjectTasks />}
-                />
-                <Route
-                  path="/projects/:projectId/tasks/:taskId/attempts/:attemptId/full"
-                  element={<ProjectTasks />}
+                  path="/mcp-servers"
+                  element={<Navigate to="/settings/mcp" replace />}
                 />
                 <Route
                   path="/projects/:projectId/tasks/:taskId"
                   element={<ProjectTasks />}
                 />
-                <Route path="/settings" element={<Settings />} />
-                <Route path="/mcp-servers" element={<McpServers />} />
-              </SentryRoutes>
-            </div>
+                <Route
+                  path="/projects/:projectId/tasks/:taskId/attempts/:attemptId"
+                  element={<ProjectTasks />}
+                />
+              </Route>
+            </SentryRoutes>
           </div>
         </SearchProvider>
-      </AppWithStyleOverride>
-    </ThemeProvider>
+      </ThemeProvider>
+    </I18nextProvider>
   );
 }
 
 function App() {
   return (
     <BrowserRouter>
-      <ConfigProvider>
-        <ProjectProvider>
-          <EditorDialogProvider>
-            <CreatePRDialogProvider>
-              <TaskDialogProvider>
+      <UserSystemProvider>
+        <ClickedElementsProvider>
+          <ProjectProvider>
+            <HotkeysProvider initiallyActiveScopes={['*', 'global', 'kanban']}>
+              <NiceModal.Provider>
                 <AppContent />
-              </TaskDialogProvider>
-            </CreatePRDialogProvider>
-          </EditorDialogProvider>
-        </ProjectProvider>
-      </ConfigProvider>
+              </NiceModal.Provider>
+            </HotkeysProvider>
+          </ProjectProvider>
+        </ClickedElementsProvider>
+      </UserSystemProvider>
     </BrowserRouter>
   );
 }

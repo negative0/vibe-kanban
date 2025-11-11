@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
+import { useNavigateWithSearch } from '@/hooks';
 import {
   Card,
   CardContent,
@@ -11,7 +11,6 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Project } from 'shared/types';
-import { ProjectForm } from './project-form';
 import { projectsApi } from '@/lib/api';
 import {
   AlertCircle,
@@ -23,7 +22,6 @@ import {
   Loader2,
   Trash2,
 } from 'lucide-react';
-import { useKeyboardShortcuts } from '@/lib/keyboard-shortcuts';
 
 interface ProjectDetailProps {
   projectId: string;
@@ -31,16 +29,10 @@ interface ProjectDetailProps {
 }
 
 export function ProjectDetail({ projectId, onBack }: ProjectDetailProps) {
-  const navigate = useNavigate();
+  const navigate = useNavigateWithSearch();
   const [project, setProject] = useState<Project | null>(null);
   const [loading, setLoading] = useState(false);
-  const [showEditForm, setShowEditForm] = useState(false);
   const [error, setError] = useState('');
-
-  useKeyboardShortcuts({
-    navigate,
-    currentPath: `/projects/${projectId}`,
-  });
 
   const fetchProject = useCallback(async () => {
     setLoading(true);
@@ -77,9 +69,8 @@ export function ProjectDetail({ projectId, onBack }: ProjectDetailProps) {
     }
   };
 
-  const handleEditSuccess = () => {
-    setShowEditForm(false);
-    fetchProject();
+  const handleEditClick = () => {
+    navigate(`/settings/projects?projectId=${projectId}`);
   };
 
   useEffect(() => {
@@ -143,7 +134,7 @@ export function ProjectDetail({ projectId, onBack }: ProjectDetailProps) {
             <CheckSquare className="mr-2 h-4 w-4" />
             View Tasks
           </Button>
-          <Button variant="outline" onClick={() => setShowEditForm(true)}>
+          <Button variant="outline" onClick={handleEditClick}>
             <Edit className="mr-2 h-4 w-4" />
             Edit
           </Button>
@@ -234,13 +225,6 @@ export function ProjectDetail({ projectId, onBack }: ProjectDetailProps) {
           </CardContent>
         </Card>
       </div>
-
-      <ProjectForm
-        open={showEditForm}
-        onClose={() => setShowEditForm(false)}
-        onSuccess={handleEditSuccess}
-        project={project}
-      />
     </div>
   );
 }
